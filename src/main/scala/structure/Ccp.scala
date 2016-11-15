@@ -66,19 +66,25 @@ class Ccp[A](
     case DefaultFundCallResponse(responder, id, payment) =>
       handleDefaultFundCallResponse(responder, id, payment)
 
-    case UnfundedDefaultFundCallResponse(responder, id, waterfallId, payment) =>
-      handleUnfundedDefaultFundCallResponse(responder, id, waterfallId, payment)
+    case UnfundedDefaultFundCallResponse(responder,
+                                         id,
+                                         waterfallId,
+                                         payment) =>
+      handleUnfundedDefaultFundCallResponse(responder,
+                                            id,
+                                            waterfallId,
+                                            payment)
 
     case Paid => sender ! totalPaid
 
     //---
-    case Waterfall(member, cost) => coverWithDefaultingMember(member, cost)
+    case Waterfall(member, cost) => coverWithDefaultedCollateral(member, cost)
 
     case CoverWithDefaultingMember(member, cost) =>
-      coverWithDefaultingMember(member, cost)
+      coverWithDefaultedCollateral(member, cost)
 
     case CoverWithNonDefaultingMembers(member, cost) =>
-      coverWithNonDefaultingMembers(member, cost)
+      coverWithNonDefaultedCollateral(member, cost)
 
     case CollectUnfundedFunds(member, cost) =>
       collectUnfundedFunds(member, cost)
@@ -106,7 +112,10 @@ class Ccp[A](
       sender ! DefaultFundCallResponse(self, id, payment min 0)
 
     case UnfundedDefaultFundCall(id, waterfallId, payment) =>
-      sender ! UnfundedDefaultFundCallResponse(self, id, waterfallId, payment min 0)
+      sender ! UnfundedDefaultFundCallResponse(self,
+                                               id,
+                                               waterfallId,
+                                               payment min 0)
 
     case Defaulted => sender ! true
 
@@ -153,14 +162,13 @@ class Ccp[A](
   /**
     * Posted margins of members.
     */
-  private val initialMargins: mutable.Map[ActorRef, BigDecimal] = {
+  private val margins: mutable.Map[ActorRef, BigDecimal] = {
     val margins =
       if (rules.ccpRules.participatesInMargin) {
         val memberMargins =
           for {
             (member, portfolio) <- memberPortfolios
-          } yield
-            (member, portfolio.margin(rules.memberRules.marginCoverage))
+          } yield (member, portfolio.margin(rules.memberRules.marginCoverage))
 
         val ccpMargins = for {
           (member, portfolio) <- ccpPortfolios
@@ -183,11 +191,8 @@ class Ccp[A](
   /**
     * Snapshot of the initial margins when setting up the CCP.
     */
-  private val initInitialMargins: Map[ActorRef, BigDecimal] =
-    initialMargins.toMap
-
-  private val variationMargins: mutable.Map[ActorRef, BigDecimal] =
-    mutable.Map.empty
+  private val initialMargins: Map[ActorRef, BigDecimal] =
+    margins.toMap
 
   /**
     * Posted default funds of members.
@@ -227,7 +232,10 @@ class Ccp[A](
       member: ActorRef
   ): Option[BigDecimal] = {
     val total =
-      initDefaultFunds.withFilter(entry => !defaultedMembers.contains(entry._1)).map(_._2).sum
+      initDefaultFunds
+        .withFilter(entry => !defaultedMembers.contains(entry._1))
+        .map(_._2)
+        .sum
 
     for {
       part <- defaultFunds.get(member)
@@ -246,23 +254,28 @@ class Ccp[A](
       member: ActorRef
   ): Option[BigDecimal] = {
     val total =
-      initInitialMargins.withFilter(entry => !defaultedMembers.contains(entry._1)).map(_._2).sum
+      initialMargins
+        .withFilter(entry => !defaultedMembers.contains(entry._1))
+        .map(_._2)
+        .sum
 
     for {
-      part <- initialMargins.get(member)
+      part <- margins.get(member)
     } yield part / total
   }
 
   /**
     * Expected margin payment after margin call.
     */
-  private val expectedMarginPayments: mutable.Map[(ActorRef, RequestId), BigDecimal] =
+  private val expectedMarginPayments: mutable.Map[(ActorRef, RequestId),
+                                                  BigDecimal] =
     mutable.Map.empty
 
   /**
     * Expected default fund payment after fund call.
     */
-  private val expectedDefaultFundPayments: mutable.Map[(ActorRef, RequestId), BigDecimal] =
+  private val expectedDefaultFundPayments: mutable.Map[(ActorRef, RequestId),
+                                                       BigDecimal] =
     mutable.Map.empty
 
   private val expectedUnfundedFundsForWaterfall: mutable.Map[RequestId,
@@ -287,19 +300,32 @@ class Ccp[A](
     * @param member member
     */
   private def memberMarginCall(member: ActorRef): Unit = {
-    implicit val timeout: Timeout = Timeout(60 seconds)
+//    implicit val timeout: Timeout = Timeout(60 seconds)
 
     for {
-      oldPrice <- prices.get(member) //OptionT(oldPriceF)
-      currentPrice <- allPortfolios.get(member).flatMap(_.price) //portfoliosOptionT(currentPriceF)
+      oldPrice <- prices.get(member)
+      initialMargin <- initialMargins.get(member)
+
+      currentPrice <- allPortfolios.get(member).flatMap(_.price)
+
       variationMargin = oldPrice - currentPrice
-      if variationMargin.abs >= rules.minimumTransfer && variationMargin != 0
-    } yield {
-      prices.put(member, currentPrice)
-      val id = generateUuid
-      expectedMarginPayments.put((member, id), variationMargin)
-      member ! MarginCall(id, variationMargin)
-    }
+
+      margin <- margins.get(member)
+      _ = margins.put(member, margin - variationMargin)
+
+      // Amount below initial margin ...
+      // (happens when previously
+      // the variation margin was too small
+      // to trigger a margin call)
+      // ... plus the variation margin.
+      marginCall = (initialMargin - margin) + variationMargin
+      if marginCall.abs >= rules.minimumTransfer && marginCall != 0
+
+      _ = prices.put(member, currentPrice)
+
+      id = generateUuid
+      _ = expectedMarginPayments.put((member, id), marginCall)
+    } yield member ! MarginCall(id, marginCall)
   }
 
   /**
@@ -316,15 +342,18 @@ class Ccp[A](
   ): Unit = {
     // Update margin with payment
     for {
-      currentMargin <- variationMargins.get(member).orElse(Some(BigDecimal("0")))
+      currentMargin <- margins.get(member)
+
       expectedPayment <- expectedMarginPayments.get((member, id))
+
       replacementCost <- allPortfolios.get(member).flatMap(_.replacementCost)
     } yield {
       logger.debug(
         s"From $member (margin call) Expected $expectedPayment, received $payment"
       )
 
-      variationMargins.put(member, currentMargin + payment) // update margin w/ payment
+      margins.put(member, currentMargin + payment)
+
       expectedDefaultFundPayments.remove((member, id))
 
       managePotentialDefault(
@@ -358,7 +387,8 @@ class Ccp[A](
         s"From $member (fund call) Expected $expectedPayment, received $payment"
       )
 
-      defaultFunds.put(member, currentDefaultFund + payment) // update fund w/ payment
+      defaultFunds
+        .put(member, currentDefaultFund + payment) // update fund w/ payment
 
       expectedDefaultFundPayments.remove((member, id))
 
@@ -387,8 +417,8 @@ class Ccp[A](
     for {
       expectedPayment <- expectedDefaultFundPayments.get((member, id))
       replacementCost <- allPortfolios.get(member).flatMap(_.replacementCost)
-      (collected, waitingFor, defaultingMember, cost) <- expectedUnfundedFundsForWaterfall.get(
-        waterfallId)
+      (collected, waitingFor, defaultingMember, cost) <- expectedUnfundedFundsForWaterfall
+        .get(waterfallId)
 
       _ = logger.debug(
         s"(collected = $collected, waitingFor = $waitingFor, member = $defaultingMember, cost = $cost")
@@ -401,12 +431,15 @@ class Ccp[A](
 
       if (waitingFor == 1) {
         expectedUnfundedFundsForWaterfall.remove(waterfallId)
-        self ! CoverWithNonDefaultingUnfundedFunds(defaultingMember, cost, collected + payment)
+        self ! CoverWithNonDefaultingUnfundedFunds(defaultingMember,
+                                                   cost,
+                                                   collected + payment)
       } else {
         logger.debug(s" PAYMENT $payment")
 
-        expectedUnfundedFundsForWaterfall
-          .put(waterfallId, (collected + payment, waitingFor - 1, defaultingMember, cost))
+        expectedUnfundedFundsForWaterfall.put(
+          waterfallId,
+          (collected + payment, waitingFor - 1, defaultingMember, cost))
       }
 
       managePotentialDefault(
@@ -462,15 +495,16 @@ class Ccp[A](
       } else {
         // Left after using margin
         val costAfterMarginUse = for {
-          margin <- initialMargins.get(defaultingMember)
+          margin <- margins.get(defaultingMember)
           costLeft = cost - margin
         } yield {
-          updateAfterCost(initialMargins)(defaultingMember, costLeft)
+          updateAfterCost(margins)(defaultingMember, costLeft)
           costLeft
         }
 
         logger.debug(
-          s"coverWithInitialMargin for $defaultingMember ${costAfterMarginUse.map(_ max 0)}")
+          s"coverWithInitialMargin for $defaultingMember ${costAfterMarginUse
+            .map(_ max 0)}")
 
         costAfterMarginUse.map(_ max 0)
       }
@@ -510,8 +544,10 @@ class Ccp[A](
     * Default coverage waterfall part of the defaulting member.
     * @return cost after coverage
     */
-  private def coverWithDefaultingMember(defaultingMember: ActorRef, cost: BigDecimal): Unit = {
-    val f = coverWithInitialMargin(defaultingMember) andThen coverWithFund(defaultingMember)
+  private def coverWithDefaultedCollateral(defaultingMember: ActorRef,
+                                           cost: BigDecimal): Unit = {
+    val f = coverWithInitialMargin(defaultingMember) andThen coverWithFund(
+        defaultingMember)
 
     f(cost) match {
       case Some(costLeft) =>
@@ -529,20 +565,24 @@ class Ccp[A](
   private def coverWithNonDefaultingInitialMargin(defaultingMember: ActorRef) =
     (cost: BigDecimal) => {
       if (cost <= 0) {
-        logger.debug(s"coverWithNonDefaultingInitialMargin for $defaultingMember 0")
+        logger.debug(
+          s"coverWithNonDefaultingInitialMargin for $defaultingMember 0")
 
         BigDecimal(0)
       } else if (rules.marginIsRingFenced) cost
       else {
         val totalInitialMargins =
-          initialMargins.withFilter(entry => !defaultedMembers.contains(entry._1)).map(_._2).sum
+          margins
+            .withFilter(entry => !defaultedMembers.contains(entry._1))
+            .map(_._2)
+            .sum
 
         allMembers
           .withFilter(!defaultedMembers.contains(_))
           .foreach(
             member => {
               for {
-                currentMargin <- initialMargins.get(member)
+                currentMargin <- margins.get(member)
                 proRata <- proRataInitialMargins(member)
                 payment = (cost min totalInitialMargins) * proRata
                 if payment != 0
@@ -571,46 +611,51 @@ class Ccp[A](
     *
     * @return cost after coverage
     */
-  private def coverWithNonDefaultingFunds(defaultingMember: ActorRef) = (cost: BigDecimal) => {
-    if (cost <= 0) {
-      logger.debug(s"coverWithNonDefaultingFunds for $defaultingMember 0")
-      BigDecimal(0)
-    } else {
-      val totalDefaultFunds =
-        defaultFunds.withFilter(entry => !defaultedMembers.contains(entry._1)).map(_._2).sum
+  private def coverWithNonDefaultingFunds(defaultingMember: ActorRef) =
+    (cost: BigDecimal) => {
+      if (cost <= 0) {
+        logger.debug(s"coverWithNonDefaultingFunds for $defaultingMember 0")
+        BigDecimal(0)
+      } else {
+        val totalDefaultFunds =
+          defaultFunds
+            .withFilter(entry => !defaultedMembers.contains(entry._1))
+            .map(_._2)
+            .sum
 
-      allMembers
-        .withFilter(!defaultedMembers.contains(_))
-        .foreach(
-          member => {
-            for {
-              currentMargin <- defaultFunds.get(member)
-              proRata <- proRataDefaultFunds(member)
-              fundPayment = (cost min totalDefaultFunds) * proRata
-              if fundPayment != 0
-            } yield {
-              val id = generateUuid
+        allMembers
+          .withFilter(!defaultedMembers.contains(_))
+          .foreach(
+            member => {
+              for {
+                currentMargin <- defaultFunds.get(member)
+                proRata <- proRataDefaultFunds(member)
+                fundPayment = (cost min totalDefaultFunds) * proRata
+                if fundPayment != 0
+              } yield {
+                val id = generateUuid
 
-              updateDefaultFund(member, currentMargin - fundPayment)
-              updateExpectedFundPayments(member, id, fundPayment)
+                updateDefaultFund(member, currentMargin - fundPayment)
+                updateExpectedFundPayments(member, id, fundPayment)
 
-              member ! DefaultFundCall(id, fundPayment)
+                member ! DefaultFundCall(id, fundPayment)
+              }
             }
-          }
-        )
+          )
 
-      logger.debug(
-        s"coverWithNonDefaultingFunds for $defaultingMember ${(cost - totalDefaultFunds) max 0}")
+        logger.debug(
+          s"coverWithNonDefaultingFunds for $defaultingMember ${(cost - totalDefaultFunds) max 0}")
 
-      (cost - totalDefaultFunds) max 0
+        (cost - totalDefaultFunds) max 0
+      }
     }
-  }
 
   /**
     * Default coverage waterfall part of the non defaulting members.
     * @return cost after coverage
     */
-  private def coverWithNonDefaultingMembers(defaultingMember: ActorRef, cost: BigDecimal): Unit = {
+  private def coverWithNonDefaultedCollateral(defaultingMember: ActorRef,
+                                              cost: BigDecimal): Unit = {
     val f = coverWithNonDefaultingFunds(defaultingMember) andThen
         coverWithNonDefaultingInitialMargin(defaultingMember)
 
@@ -622,32 +667,38 @@ class Ccp[A](
     *
     * @return cost after coverage
     */
-  private def collectUnfundedFunds(defaultingMember: ActorRef, cost: BigDecimal): Unit = {
+  private def collectUnfundedFunds(defaultingMember: ActorRef,
+                                   cost: BigDecimal): Unit = {
     if (cost <= 0) {
-      logger.debug(s"coverWithNonDefaultingUnfundedFunds for $defaultingMember 0")
+      logger.debug(
+        s"coverWithNonDefaultingUnfundedFunds for $defaultingMember 0")
       self ! WaterfallResult(Some(0))
     } else {
       implicit val timeout: Timeout = Timeout(60 seconds)
       val nonDefaultedMembers =
-        allMembers.diff(defaultedMembers)
+        allMembers diff defaultedMembers
 
       val fundPayments: Map[ActorRef, BigDecimal] =
         nonDefaultedMembers.flatMap(member => {
           for {
             proRata <- proRataDefaultFunds(member)
             fundLeft <- unfundedFundsLeft.get(member)
-            _ = logger.debug(s"Fund left $fundLeft and proRata $proRata")
-          } yield {
-            val unfundedCall = (cost * proRata) min fundLeft
-            unfundedFundsLeft.put(member, fundLeft - unfundedCall) // TODO needs its own function?
 
-            member -> unfundedCall
-          }
+            _ = logger.debug(s"Fund left $fundLeft and proRata $proRata")
+
+            unfundedCall = (cost * proRata) min fundLeft
+
+            _ = unfundedFundsLeft
+              .put(member, fundLeft - unfundedCall) // TODO needs its own function?
+          } yield member -> unfundedCall
         })(breakOut)
 
       val waterfallId = generateUuid
 
-      updateWaterfallWaiting(waterfallId, fundPayments.size, defaultingMember, cost)
+      updateWaterfallWaiting(waterfallId,
+                             fundPayments.size,
+                             defaultingMember,
+                             cost)
 
       fundPayments.foreach {
         case (member, fundPayment) =>
@@ -659,9 +710,10 @@ class Ccp[A](
     }
   }
 
-  private def coverWithNonDefaultingUnfundedFunds(defaultingMember: ActorRef,
-                                                  cost: BigDecimal,
-                                                  collected: BigDecimal): Unit = {
+  private def coverWithNonDefaultingUnfundedFunds(
+      defaultingMember: ActorRef,
+      cost: BigDecimal,
+      collected: BigDecimal): Unit = {
     val costLeft = cost - collected
 
     if (costLeft <= 0) self ! WaterfallResult(Some(0))
@@ -672,7 +724,8 @@ class Ccp[A](
     * Covers the cost with CCPs own equity. First step.
     * @return cost after coverage
     */
-  private def coverWithFirstLevelEquity(defaultingMember: ActorRef, cost: BigDecimal): Unit = {
+  private def coverWithFirstLevelEquity(defaultingMember: ActorRef,
+                                        cost: BigDecimal): Unit = {
     if (cost <= 0) {
       self ! WaterfallResult(Some(0))
     } else {
@@ -681,7 +734,8 @@ class Ccp[A](
       equity -= paid
       totalPaid += paid
 
-      logger.debug(s"coverWithFirstLevelEquity for $defaultingMember to ${costLeft max 0}")
+      logger.debug(
+        s"coverWithFirstLevelEquity for $defaultingMember to ${costLeft max 0}")
 
       self ! CoverWithNonDefaultingMembers(defaultingMember, costLeft max 0)
     }
@@ -691,7 +745,8 @@ class Ccp[A](
     * Covers the cost with the CCPs own equity. Last step.
     * @return cost after coverage
     */
-  private def coverWithSecondLevelEquity(defaultingMember: ActorRef, cost: BigDecimal) = {
+  private def coverWithSecondLevelEquity(defaultingMember: ActorRef,
+                                         cost: BigDecimal) = {
     if (cost <= 0) {
       self ! WaterfallResult(Some(0))
     } else {
@@ -700,7 +755,8 @@ class Ccp[A](
       equity -= paid
       totalPaid += paid
 
-      logger.debug(s"coverWithSecondLevelEquity for $defaultingMember to ${costLeft max 0}")
+      logger.debug(
+        s"coverWithSecondLevelEquity for $defaultingMember to ${costLeft max 0}")
 
       self ! WaterfallResult(Some(0))
     }
@@ -750,7 +806,7 @@ class Ccp[A](
       member: ActorRef,
       initialMargin: BigDecimal
   ): Unit = {
-    initialMargins.put(member, initialMargin max 0)
+    margins.put(member, initialMargin max 0)
   }
 
   /**
@@ -795,7 +851,8 @@ class Ccp[A](
                                      waitingFor: Int,
                                      defaultingMember: ActorRef,
                                      cost: BigDecimal): Unit = {
-    expectedUnfundedFundsForWaterfall.put(id, (0, waitingFor, defaultingMember, cost))
+    expectedUnfundedFundsForWaterfall
+      .put(id, (0, waitingFor, defaultingMember, cost))
   }
 }
 
@@ -808,7 +865,13 @@ object Ccp {
       rules: Rules,
       shouldDefault: Boolean = false
   ): Props = {
-    Props(new Ccp(name, memberPortfolios, ccpPortfolios, equity, rules, shouldDefault))
+    Props(
+      new Ccp(name,
+              memberPortfolios,
+              ccpPortfolios,
+              equity,
+              rules,
+              shouldDefault))
   }
 
   /**
@@ -827,7 +890,8 @@ object Ccp {
       ccpRules: CcpRules
   )
 
-  case class MemberRules(marginCoverage: BigDecimal, fundParticipation: BigDecimal)
+  case class MemberRules(marginCoverage: BigDecimal,
+                         fundParticipation: BigDecimal)
 
   case class CcpRules(participatesInMargin: Boolean,
                       marginCoverage: BigDecimal,

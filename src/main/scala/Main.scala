@@ -3,7 +3,8 @@ import CcpProtocol.Paid
 import akka.actor.{ActorRef, ActorSystem}
 import akka.pattern.ask
 import akka.util.Timeout
-import breeze.stats.distributions.Gaussian
+import breeze.linalg.{DenseMatrix, DenseVector}
+import breeze.stats.distributions.MultivariateGaussian
 import com.typesafe.config.ConfigFactory
 
 import scala.collection.concurrent.TrieMap
@@ -22,36 +23,47 @@ object Main extends App {
   val system = ActorSystem("System", ConfigFactory.load())
 
   val pos1 = Security("pos1")
+  val pos2 = Security("pos2")
+
+  //
+//  implicit val market = Market[Security](
+//    TrieMap[Security, PriceData](
+//      (pos1, PriceData(BigDecimal("100"), Gaussian(0.05, 0.2)))
+//    )
+//  )
 
   implicit val market = Market[Security](
-    TrieMap[Security, PriceData](
-      (pos1, PriceData(BigDecimal("100"), Gaussian(0.05, 0.2)))
-    )
-  )
+    TrieMap(pos1 -> BigDecimal("100"), pos2 -> BigDecimal("50")),
+    Map(pos1 -> 0, pos2 -> 1),
+    MultivariateGaussian(DenseVector(0.05, 0.25),
+                         DenseMatrix((0.25, 0.0), (0.0, 0.5))))
 
-  val longPortfolio = Portfolio(List(Position(pos1, 1)))
-  val shortPortfolio = longPortfolio.inverse
+  val longPortfolio = Portfolio(Map((pos1, 1)))
+//  val shortPortfolio = longPortfolio.inverse
+//  val emptyPortfolio = Portfolio(Map.empty[Security, Long])
 
   val member1 =
     system.actorOf(
       Member.props("member 1", longPortfolio, shouldDefault = true)
     )
 
-  val member2 = system.actorOf(Member.props("member 2", shortPortfolio))
+  val member2 =
+    system.actorOf(Member.props("member 2", longPortfolio))
 
   val member3 = system.actorOf(
     Member.props("member 3", longPortfolio, shouldDefault = true)
   )
 
-  val member4 = system.actorOf(Member.props("member 4", shortPortfolio))
+  val member4 =
+    system.actorOf(Member.props("member 4", longPortfolio))
 
   lazy val ccp1: ActorRef = system.actorOf(
     props[Security](
       "ccp1",
       Map(member1 -> longPortfolio,
           member3 -> longPortfolio,
-          member4 -> shortPortfolio),
-      Map(ccp2 -> shortPortfolio),
+          member4 -> longPortfolio),
+      Map(ccp2 -> longPortfolio),
       equity = BigDecimal("10"),
       Rules(
         marginIsRingFenced = false,
@@ -70,17 +82,17 @@ object Main extends App {
   lazy val ccp2: ActorRef = system.actorOf(
     props[Security](
       "ccp2",
-      Map(member2 -> shortPortfolio),
+      Map(member2 -> longPortfolio),
       Map(ccp1 -> longPortfolio),
       equity = BigDecimal("100000"),
       Rules(
         marginIsRingFenced = true,
         maximumFundCall = 1000,
-        minimumTransfer = 0 ,
-        MemberRules(marginCoverage = BigDecimal("0.99"),
+        minimumTransfer = 0,
+        MemberRules(marginCoverage = BigDecimal("0.95"),
                     fundParticipation = BigDecimal("0.2")),
         CcpRules(participatesInMargin = true,
-                 marginCoverage = BigDecimal("0.99"),
+                 marginCoverage = BigDecimal("0.95"),
                  fundParticipation = BigDecimal("0.2"))
       )
     )

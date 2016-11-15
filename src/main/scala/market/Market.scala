@@ -1,34 +1,79 @@
-import breeze.stats.distributions.Gaussian
+import Market.{Index, Price}
+import breeze.linalg.{Axis, DenseVector}
+import breeze.numerics.sqrt
+import breeze.stats.distributions.{Gaussian, MultivariateGaussian}
 
-import scala.collection.concurrent.Map
+import scala.collection._
 
 /**
   * Created by dennis on 9/10/16.
   */
-case class Market[A](items: Map[A, PriceData]) {
-  def price(item: A): Option[BigDecimal] = {
+case class Market[A](prices: concurrent.Map[A, Price],
+                     indexes: Map[A, Index],
+                     distr: MultivariateGaussian) {
+  private val icdf = (p: Double) => BigDecimal(Gaussian(0, 1).icdf(p))
+
+  def price(item: A): Option[Price] = {
     for {
-      priceData <- items.get(item)
-    } yield priceData.price
+      price <- prices.get(item)
+    } yield price
   }
 
   def shockAll(shock: BigDecimal): Unit = {
-    items.keys.foreach(shockItem(_, shock))
+    prices.keys.foreach(shockItem(_, shock))
   }
 
-  def shockItem(item: A, shock: BigDecimal) = {
+  def shockItem(item: A, shock: BigDecimal): Unit = {
     for {
-      priceData <- items.get(item)
-      shockedPriceData = PriceData(priceData.price * (1 + shock),
-                                   priceData.returnDistr)
-    } items.replace(item, shockedPriceData)
+      price <- prices.get(item)
+      shockedPriceData = price * (1 + shock)
+    } prices.replace(item, shockedPriceData)
   }
 
-  def returnDistr(item: A): Option[Gaussian] = {
-    for {
-      priceData <- items.get(item)
-    } yield priceData.returnDistr
+  def margin(portfolio: Portfolio[A],
+             coverage: BigDecimal): Option[BigDecimal] = {
+    val pItems = portfolio.positions.keys
+
+    val pIndexes = indexes.filterKeys(pItems.toSet)
+
+    val indexesToStrip = indexes.filterNot(x => pIndexes.contains(x._1)).values
+
+    if (pIndexes.size != portfolio.positions.size)
+      None // Market does not contain all portfolio elements.
+    else {
+      for {
+        price <- portfolio.price
+
+        weights = portfolio.weights.values
+
+        pWeights = DenseVector(weights.toList: _*)
+          .map(_.doubleValue)
+          .asDenseMatrix
+
+        mus = distr.mean.toDenseMatrix
+          .delete(indexesToStrip.toSeq, Axis._1)
+          .toDenseVector
+
+        pCov = distr.covariance
+          .delete(indexesToStrip.toSeq, Axis._0)
+          .delete(indexesToStrip.toSeq, Axis._1)
+
+        varM = pWeights.t * pCov * pWeights
+        if varM.rows == 1 && varM.cols == 1
+
+        pSigma = sqrt(varM(0, 0))
+
+        z = icdf(coverage.doubleValue)
+
+        pMu = (mus :* pWeights.toDenseVector).toArray.sum
+
+        valueAtRisk = price * (pMu - pSigma * z)
+      } yield -valueAtRisk // valueAtRisk is negative, we flip the sign.
+    }
   }
 }
 
-case class PriceData(price: BigDecimal, returnDistr: Gaussian)
+object Market {
+  type Price = BigDecimal
+  type Index = Int
+}

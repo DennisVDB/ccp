@@ -5,7 +5,8 @@ import com.typesafe.scalalogging.Logger
 
 case class Member(
     name: String,
-    portfolio: Portfolio[Security],
+    portfolio: Portfolio[Security], // TODO remove
+    _cash: BigDecimal,
     shouldDefault: Boolean
 ) extends Actor {
   private val logger = Logger(name)
@@ -15,16 +16,16 @@ case class Member(
 
   def notDefaulted: Receive = LoggingReceive {
     case MarginCall(id, payment) =>
-      totalPaid += updatePaid(payment)
-      sender ! MarginCallResponse(self, id, payment)
+      sender ! MarginCallResponse(self, id, handlePayment(payment))
 
     case DefaultFundCall(id, payment) =>
-      totalPaid += updatePaid(payment)
-      sender ! DefaultFundCallResponse(self, id, payment)
+      sender ! DefaultFundCallResponse(self, id, handlePayment(payment))
 
     case UnfundedDefaultFundCall(id, waterfallId, payment) =>
-      totalPaid += updatePaid(payment)
-      sender ! UnfundedDefaultFundCallResponse(self, id, waterfallId, payment)
+      sender ! UnfundedDefaultFundCallResponse(self,
+                                               id,
+                                               waterfallId,
+                                               handlePayment(payment))
 
     case Default =>
       logger.debug(s"----- defaulted! -----")
@@ -42,7 +43,10 @@ case class Member(
       sender ! DefaultFundCallResponse(self, id, payment min 0)
 
     case UnfundedDefaultFundCall(id, waterfallId, payment) =>
-      sender ! UnfundedDefaultFundCallResponse(self, id, waterfallId, payment min 0)
+      sender ! UnfundedDefaultFundCallResponse(self,
+                                               id,
+                                               waterfallId,
+                                               payment min 0)
 
     case Defaulted => sender ! true
 
@@ -52,14 +56,29 @@ case class Member(
   private var totalPaid: BigDecimal = 0
 
   private val updatePaid: BigDecimal => BigDecimal = _ max 0
+
+  private var cash = _cash
+
+  def handlePayment(payment: BigDecimal): BigDecimal = {
+    if (payment >= 0) {
+      val paying = payment min cash
+      totalPaid += paying
+      cash -= paying
+
+      if (paying < payment) context become defaulted
+
+      paying
+    } else payment
+  }
 }
 
 object Member {
   def props(
       name: String,
       portfolio: Portfolio[Security],
+      cash: BigDecimal = BigDecimal(Double.MaxValue),
       shouldDefault: Boolean = false
   ): Props = {
-    Props(Member(name, portfolio, shouldDefault))
+    Props(Member(name, portfolio, cash, shouldDefault))
   }
 }

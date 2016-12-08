@@ -1,7 +1,9 @@
-import Market.{Index, Price}
+package market
+
 import breeze.linalg.{Axis, DenseVector}
 import breeze.numerics.sqrt
 import breeze.stats.distributions.{Gaussian, MultivariateGaussian}
+import market.Market.{Index, Price}
 
 import scala.collection._
 
@@ -44,13 +46,16 @@ case class Market[A](prices: concurrent.Map[A, Price],
       for {
         price <- portfolio.price
 
-        weights = portfolio.weights.values
+        // We compute for a long portfolio
+        p = if (price >= 0) portfolio else portfolio.inverse
+
+        weights = p.weights.values // .map(w => if (price < 0) -w else w)
 
         pWeights = DenseVector(weights.toList: _*)
           .map(_.doubleValue)
           .asDenseMatrix
 
-        mus = distr.mean.toDenseMatrix
+        muVec = distr.mean.toDenseMatrix
           .delete(indexesToStrip.toSeq, Axis._1)
           .toDenseVector
 
@@ -65,9 +70,12 @@ case class Market[A](prices: concurrent.Map[A, Price],
 
         z = icdf(coverage.doubleValue)
 
-        pMu = (mus :* pWeights.toDenseVector).toArray.sum
+        pMu = (muVec :* pWeights.toDenseVector).toArray.sum
 
-        valueAtRisk = price * (pMu - pSigma * z)
+        // If base portfolio is long we take lower bound, if long we take the upper bound.
+        ret = if (price >= 0) pMu - pSigma * z else pMu + pSigma * z
+
+        valueAtRisk = price * ret
       } yield -valueAtRisk // valueAtRisk is negative, we flip the sign.
     }
   }

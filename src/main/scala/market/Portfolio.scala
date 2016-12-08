@@ -1,7 +1,8 @@
+package market
+
 //import scalaz.std.list._
 //import scalaz.std.option._
 //import scalaz.syntax.traverse._
-import DataUtil._
 import breeze.stats.distributions.Gaussian
 
 import scala.collection.breakOut
@@ -10,7 +11,7 @@ import scala.collection.breakOut
   * Created by dennis on 6/10/16.
   */
 case class Portfolio[A](positions: Map[A, Long])(implicit market: Market[A]) {
-  require(price.getOrElse(BigDecimal(42)) > 0, "Price of portfolio must be positive.")
+//  require(price.getOrElse(BigDecimal(42)) > 0, "Price of portfolio must be positive.")
 
   private val cumStdNorm = (p: Double) => BigDecimal(Gaussian(0, 1).icdf(p))
 
@@ -22,8 +23,6 @@ case class Portfolio[A](positions: Map[A, Long])(implicit market: Market[A]) {
         for {
           price <- market.price(item)
           total <- this.price
-          if total > 0 // Only long porfolios
-
           weight = (price * amount) / total
         } yield item -> weight
     }
@@ -64,6 +63,8 @@ case class Portfolio[A](positions: Map[A, Long])(implicit market: Market[A]) {
 //    market.margin(Portfolio(Map(position -> n)), coverage)
 
   val isEmpty: Boolean = positions.isEmpty
+
+  val isShort: Option[Boolean] = price map (_ < 0)
 
   private val implMarket: Market[A] = market
 }

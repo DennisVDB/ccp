@@ -1,5 +1,7 @@
-import Ccp.TriggerMarginCalls
+package structure
+
 import akka.actor.{Actor, ActorRef, Props}
+import structure.Ccp.TriggerMarginCalls
 
 /**
   * Created by dennis on 23/10/16.

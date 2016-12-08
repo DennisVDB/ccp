@@ -1,55 +1,66 @@
+package structure
+
 import akka.actor.ActorRef
 
 /**
-  * Created by dennis on 16/10/16.
+  * Created by dennis on 8/12/16.
   */
-object CcpProtocol {
-  sealed trait Message
+trait CcpProtocol
 
-  case class MarginCall(id: RequestId, payment: BigDecimal) extends Message
+case class MarginCall(id: RequestId, payment: BigDecimal, maxDelay: Long) extends CcpProtocol
 
-  case class MarginCallResponse(counterParty: ActorRef, id: RequestId, payment: BigDecimal)
-      extends Message
+case class MarginCallResponse(counterParty: ActorRef,
+                              id: RequestId,
+                              payment: BigDecimal)
+    extends CcpProtocol
 
-  case class DefaultFundCall(id: RequestId, payment: BigDecimal) extends Message
+case class DefaultFundCall(id: RequestId, payment: BigDecimal, maxDelay: Long)
+    extends CcpProtocol
 
-  case class DefaultFundCallResponse(counterParty: ActorRef, id: RequestId, payment: BigDecimal)
-      extends Message
+case class DefaultFundCallResponse(counterParty: ActorRef,
+                                   id: RequestId,
+                                   payment: BigDecimal)
+    extends CcpProtocol
 
-  case class UnfundedDefaultFundCall(id: RequestId, waterfallId: RequestId, payment: BigDecimal)
-      extends Message
+case class UnfundedDefaultFundCall(id: RequestId,
+                                   waterfallId: RequestId,
+                                   payment: BigDecimal, maxDelay: Long)
+    extends CcpProtocol
 
-  case class UnfundedDefaultFundCallResponse(counterParty: ActorRef,
-                                             id: RequestId,
-                                             waterfallId: RequestId,
-                                             payment: BigDecimal)
-      extends Message
+case class UnfundedDefaultFundCallResponse(counterParty: ActorRef,
+                                           id: RequestId,
+                                           waterfallId: RequestId,
+                                           payment: BigDecimal)
+    extends CcpProtocol
 
-  case object Default extends Message
+case object Default extends CcpProtocol
 
-  case object Defaulted extends Message
+case object Defaulted extends CcpProtocol
 
-  case object Paid extends Message
+case object Paid extends CcpProtocol
 
-  case class Waterfall(member: ActorRef, cost: BigDecimal) extends Message
+case class Waterfall(member: ActorRef, cost: BigDecimal) extends CcpProtocol
 
-  case class CoverWithDefaultingMember(member: ActorRef, cost: BigDecimal) extends Message
+case class CoverWithDefaultingMember(member: ActorRef, cost: BigDecimal)
+    extends CcpProtocol
 
-  case class CoverWithNonDefaultingMembers(member: ActorRef, cost: BigDecimal) extends Message
+case class CoverWithNonDefaultingMembers(member: ActorRef, cost: BigDecimal)
+    extends CcpProtocol
 
-  case class CollectUnfundedFunds(member: ActorRef, cost: BigDecimal) extends Message
+case class CollectUnfundedFunds(member: ActorRef, cost: BigDecimal)
+    extends CcpProtocol
 
-  case class CoverWithNonDefaultingUnfundedFunds(member: ActorRef,
-                                                 cost: BigDecimal,
-                                                 collected: BigDecimal)
-      extends Message
+case class CoverWithNonDefaultingUnfundedFunds(member: ActorRef,
+                                               cost: BigDecimal,
+                                               collected: BigDecimal)
+    extends CcpProtocol
 
-  case class CoverWithFirstLevelEquity(member: ActorRef, cost: BigDecimal) extends Message
+case class CoverWithFirstLevelEquity(member: ActorRef, cost: BigDecimal)
+    extends CcpProtocol
 
-  case class CoverWithSecondLevelEquity(member: ActorRef, cost: BigDecimal) extends Message
+case class CoverWithSecondLevelEquity(member: ActorRef, cost: BigDecimal)
+    extends CcpProtocol
 
-  case class WaterfallResult(costLeft: Option[BigDecimal])
+case class WaterfallResult(costLeft: Option[BigDecimal])
 
-  class RequestId(val id: String) extends AnyVal
-
-}
+class RequestId(val id: String) extends AnyVal

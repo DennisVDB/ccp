@@ -10,10 +10,15 @@ case class Member(name: String,
                   assets: mutable.LinkedHashMap[Long, BigDecimal],
                   scheduler: ActorRef)
     extends Actor {
+  private var totalPaid: BigDecimal = 0
+  private var currentTime = 0L
   private val logger = Logger(name)
 
   override def receive: Receive = {
     case TimedMessage(t, m) =>
+      assert(t >= currentTime, "Received message from the past.")
+      currentTime = currentTime max t
+
       m match {
         case MarginCall(id, payment, maxDelay) =>
           val tp = handlePayment(payment, maxDelay)
@@ -35,51 +40,8 @@ case class Member(name: String,
       }
   }
 
-//  override def receive: Receive =
-//    if (shouldDefault) defaulted else notDefaulted
-//
-//  def notDefaulted: Receive = LoggingReceive {
-//    case MarginCall(id, payment) =>
-//      sender ! MarginCallResponse(self, id, handlePayment(payment))
-//
-//    case DefaultFundCall(id, payment) =>
-//      sender ! DefaultFundCallResponse(self, id, handlePayment(payment))
-//
-//    case UnfundedDefaultFundCall(id, waterfallId, payment) =>
-//      sender ! UnfundedDefaultFundCallResponse(self,
-//                                               id,
-//                                               waterfallId,
-//                                               handlePayment(payment))
-//
-//    case Default =>
-//      logger.debug(s"----- defaulted! -----")
-//      context become defaulted
-//    case Defaulted => sender ! false
-//
-//    case Paid => sender ! totalPaid
-//  }
-//
-//  def defaulted: Receive = LoggingReceive {
-//    case MarginCall(id, payment) =>
-//      sender ! MarginCallResponse(self, id, payment min 0)
-//
-//    case DefaultFundCall(id, payment) =>
-//      sender ! DefaultFundCallResponse(self, id, payment min 0)
-//
-//    case UnfundedDefaultFundCall(id, waterfallId, payment) =>
-//      sender ! UnfundedDefaultFundCallResponse(self,
-//                                               id,
-//                                               waterfallId,
-//                                               payment min 0)
-//
-//    case Defaulted => sender ! true
-//
-//    case Paid => sender ! totalPaid
-//  }
-
-  private var totalPaid: BigDecimal = 0
-
-  def handlePayment(payment: BigDecimal, maxDelay: Long): TimedPayment = {
+  private def handlePayment(payment: BigDecimal,
+                            maxDelay: Long): TimedPayment = {
     var paymentLeft = payment
     var delay = 0L
 

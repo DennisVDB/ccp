@@ -1,20 +1,21 @@
 package structure
 
 import akka.actor.ActorRef
+import structure.Timed.Time
 
 /**
   * Created by dennis on 8/12/16.
   */
 trait CcpProtocol
 
-case class MarginCall(id: RequestId, payment: BigDecimal, maxDelay: Long) extends CcpProtocol
+case class MarginCall(id: RequestId, payment: BigDecimal, maxDelay: Time) extends CcpProtocol
 
 case class MarginCallResponse(counterParty: ActorRef,
                               id: RequestId,
                               payment: BigDecimal)
     extends CcpProtocol
 
-case class DefaultFundCall(id: RequestId, payment: BigDecimal, maxDelay: Long)
+case class DefaultFundCall(id: RequestId, payment: BigDecimal, maxDelay: Time)
     extends CcpProtocol
 
 case class DefaultFundCallResponse(counterParty: ActorRef,
@@ -24,7 +25,7 @@ case class DefaultFundCallResponse(counterParty: ActorRef,
 
 case class UnfundedDefaultFundCall(id: RequestId,
                                    waterfallId: RequestId,
-                                   payment: BigDecimal, maxDelay: Long)
+                                   payment: BigDecimal, maxDelay: Time)
     extends CcpProtocol
 
 case class UnfundedDefaultFundCallResponse(counterParty: ActorRef,

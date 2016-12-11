@@ -3,37 +3,48 @@ package market
 import breeze.linalg.{Axis, DenseVector}
 import breeze.numerics.sqrt
 import breeze.stats.distributions.{Gaussian, MultivariateGaussian}
+import cats.implicits._
 import market.Market.{Index, Price}
+import structure.Timed.Time
 
 import scala.collection._
 
 /**
   * Created by dennis on 9/10/16.
   */
-case class Market[A](prices: concurrent.Map[A, Price],
-                     indexes: Map[A, Index],
-                     distr: MultivariateGaussian) {
+case class Market[A](prices: Map[A, Price], indexes: Map[A, Index], distr: MultivariateGaussian) {
   private val icdf = (p: Double) => BigDecimal(Gaussian(0, 1).icdf(p))
 
-  def price(item: A): Option[Price] = {
-    for {
-      price <- prices.get(item)
-    } yield price
+  private val generatedPrices = concurrent.TrieMap(0 -> prices)
+
+  def price(time: Time)(item: A): Option[Price] = {
+    def generatePrices(t: Time): Option[Map[A, Price]] = {
+      val rs = distr.draw()
+
+      indexes.keys
+        .map(a =>
+          for {
+            ps <- generatedPrices.get(t - 1).orElse(generatePrices(t - 1))
+            p <- ps.get(a)
+            i <- indexes.get(a)
+            r = rs(i)
+          } yield a -> p * (1 + r))
+        .toList
+        .sequence[Option, (A, Price)]
+        .map(_.toMap)
+    }
+
+    generatedPrices.get(time) match {
+      case Some(ps) => ps.get(item)
+      case None =>
+        for {
+          ps <- generatePrices(time)
+          p <- ps.get(item)
+        } yield p
+    }
   }
 
-  def shockAll(shock: BigDecimal): Unit = {
-    prices.keys.foreach(shockItem(_, shock))
-  }
-
-  def shockItem(item: A, shock: BigDecimal): Unit = {
-    for {
-      price <- prices.get(item)
-      shockedPriceData = price * (1 + shock)
-    } prices.replace(item, shockedPriceData)
-  }
-
-  def margin(portfolio: Portfolio[A],
-             coverage: BigDecimal): Option[BigDecimal] = {
+  def margin(time: Time)(portfolio: Portfolio[A], coverage: BigDecimal): Option[BigDecimal] = {
     val pItems = portfolio.positions.keys
 
     val pIndexes = indexes.filterKeys(pItems.toSet)
@@ -44,20 +55,16 @@ case class Market[A](prices: concurrent.Map[A, Price],
       None // Market does not contain all portfolio elements.
     else {
       for {
-        price <- portfolio.price
+        price <- portfolio.price(time)
 
         // We compute for a long portfolio
         p = if (price >= 0) portfolio else portfolio.inverse
 
-        weights = p.weights.values // .map(w => if (price < 0) -w else w)
+        weights = p.weights(time).values // .map(w => if (price < 0) -w else w)
 
-        pWeights = DenseVector(weights.toList: _*)
-          .map(_.doubleValue)
-          .asDenseMatrix
+        pWeights = DenseVector(weights.toList: _*).map(_.doubleValue).asDenseMatrix
 
-        muVec = distr.mean.toDenseMatrix
-          .delete(indexesToStrip.toSeq, Axis._1)
-          .toDenseVector
+        muVec = distr.mean.toDenseMatrix.delete(indexesToStrip.toSeq, Axis._1).toDenseVector
 
         pCov = distr.covariance
           .delete(indexesToStrip.toSeq, Axis._0)

@@ -1,30 +1,34 @@
 package structure
 
 import akka.actor.{Actor, ActorRef, Props}
-import structure.Ccp.TriggerMarginCalls
+import market.Market
+import structure.Scheduler.scheduleMessageWith
+import structure.Timed.Time
 
 /**
   * Created by dennis on 23/10/16.
   */
-case class Scenario[A](ccps: List[ActorRef], market: Market[A]) extends Actor {
+case class Scenario[A](ccps: List[ActorRef],
+                       market: Market[A],
+                       timeHorizon: Time,
+                       scheduler: ActorRef)
+    extends Actor {
   override def receive: Receive = {
-    case TriggerMarginCalls =>
-      market.shockAll(BigDecimal("-0.9"))
-      ccps.head ! TriggerMarginCalls
-//      ccps.foreach(_ ! TriggerMarginCalls)
-//      for (i <- 0 to 100) {
-//        ccps.foreach(ccp => ccp ! TriggerMarginCalls)
-////        market.shockAll(r.nextGaussian())
-//        market.shockAll(-Math.abs(r.nextGaussian()))
-//      }
-//      self ! TriggerMarginCalls
+    case Scenario.Run =>
+      ccps.foreach(_ ! Ccp.Run(timeHorizon))
+      scheduler ! Scheduler.Run
   }
 
-  val r = scala.util.Random
+  private def scheduleMessage = scheduleMessageWith(scheduler) _
 }
 
 object Scenario {
-  def props[A](ccps: List[ActorRef], market: Market[A]): Props = {
-    Props(Scenario(ccps, market))
+  def props[A](ccps: List[ActorRef],
+               market: Market[A],
+               timeHorizon: Time,
+               scheduler: ActorRef): Props = {
+    Props(Scenario(ccps, market, timeHorizon, scheduler))
   }
+
+  case object Run
 }

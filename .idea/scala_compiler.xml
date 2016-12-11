@@ -5,7 +5,9 @@
     <option name="featureWarnings" value="true" />
     <option name="incrementalityType" value="SBT" />
     <profile name="SBT 1" modules="ccp">
-      <option name="postfixOps" value="true" />
+      <plugins>
+        <plugin path="$USER_HOME$/.ivy2/cache/org.spire-math/kind-projector_2.11/jars/kind-projector_2.11-0.9.3.jar" />
+      </plugins>
     </profile>
   </component>
 </project>

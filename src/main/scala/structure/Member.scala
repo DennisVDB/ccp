@@ -2,17 +2,16 @@ package structure
 
 import akka.actor.{Actor, ActorRef, Props}
 import com.typesafe.scalalogging.Logger
-import structure.Scheduler.ScheduledMessage
+import structure.Scheduler.scheduleMessageWith
+import structure.Timed.Time
+import util.PaymentUtil.{Update, handlePayment}
 
-import scala.collection.mutable
-
-case class Member(name: String,
-                  assets: mutable.LinkedHashMap[Long, BigDecimal],
-                  scheduler: ActorRef)
+case class Member(name: String, _assets: Map[Time, BigDecimal], scheduler: ActorRef)
     extends Actor {
   private var totalPaid: BigDecimal = 0
-  private var currentTime = 0L
+  private var currentTime = 0
   private val logger = Logger(name)
+  private var assets = _assets
 
   override def receive: Receive = {
     case TimedMessage(t, m) =>
@@ -21,58 +20,41 @@ case class Member(name: String,
 
       m match {
         case MarginCall(id, payment, maxDelay) =>
-          val tp = handlePayment(payment, maxDelay)
-          val m = MarginCallResponse(self, id, tp.payment)
-          scheduler ! ScheduledMessage(sender, TimedMessage(t + tp.delay, m))
+          val u = handlePayment(assets, payment, maxDelay)
+          update(u)
+          scheduleMessage(t + u.timedPayment.delay,
+                          sender,
+                          MarginCallResponse(self, id, u.timedPayment.payment))
 
         case DefaultFundCall(id, payment, maxDelay) =>
-          val tp = handlePayment(payment, maxDelay)
-          val m = DefaultFundCallResponse(self, id, tp.payment)
-          scheduler ! ScheduledMessage(sender, TimedMessage(t + tp.delay, m))
+          val u = handlePayment(assets, payment, maxDelay)
+          update(u)
+          scheduleMessage(t + u.timedPayment.delay,
+                          sender,
+                          DefaultFundCallResponse(self, id, u.timedPayment.payment))
 
         case UnfundedDefaultFundCall(id, waterfallId, payment, maxDelay) =>
-          val tp = handlePayment(payment, maxDelay)
-          val m =
-            UnfundedDefaultFundCallResponse(self, id, waterfallId, tp.payment)
-          scheduler ! ScheduledMessage(sender, TimedMessage(t + tp.delay, m))
+          val u = handlePayment(assets, payment, maxDelay)
+          update(u)
+          scheduleMessage(
+            t + u.timedPayment.delay,
+            sender,
+            UnfundedDefaultFundCallResponse(self, id, waterfallId, u.timedPayment.payment))
 
         // TODO Defaulted and Paid
       }
   }
 
-  private def handlePayment(payment: BigDecimal,
-                            maxDelay: Long): TimedPayment = {
-    var paymentLeft = payment
-    var delay = 0L
-
-    (0 to maxDelay).foreach(liquidity => {
-      for {
-        available <- assets.get(liquidity)
-        payment = available min paymentLeft
-      } yield {
-        assets += (liquidity -> (available - payment))
-        paymentLeft -= payment
-        if (payment > 0) delay = liquidity
-      }
-    })
-
-    val paid = payment - paymentLeft
-
-    totalPaid += paid
-
-    TimedPayment(paid, delay)
+  private def update(u: Update) = {
+    assets = u.assets
+    totalPaid += u.timedPayment.payment
   }
+
+  private def scheduleMessage = scheduleMessageWith(scheduler) _
 }
 
 object Member {
-  def props(
-      name: String,
-      assets: Map[Long, BigDecimal],
-      scheduler: ActorRef
-  ): Props = {
-    Props(
-      Member(name,
-             mutable.LinkedHashMap(assets.toSeq.sortBy(_._1): _*),
-             scheduler))
+  def props(name: String, assets: Map[Time, BigDecimal], scheduler: ActorRef): Props = {
+    Props(Member(name, assets, scheduler))
   }
 }

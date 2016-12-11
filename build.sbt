@@ -14,6 +14,8 @@ libraryDependencies ++= Seq(
   "com.typesafe.scala-logging" %% "scala-logging" % "3.5.0"
 )
 
+addCompilerPlugin("org.spire-math" %% "kind-projector" % "0.9.3")
+
 //resolvers ++= Seq(
 //  // other resolvers here
 //  // if you want to use snapshot builds (currently 0.12-SNAPSHOT), use this.

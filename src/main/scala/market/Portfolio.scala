@@ -1,6 +1,5 @@
 package market
 
-import breeze.stats.distributions.Gaussian
 import structure.Timed.Time
 import util.DataUtil.sumList
 
@@ -9,14 +8,12 @@ import scala.collection.breakOut
 /**
   * Created by dennis on 6/10/16.
   */
-case class Portfolio[A](positions: Map[A, Long], liquidity: Time)(implicit market: Market[A]) {
+case class Portfolio[A](positions: Map[A, Int], liquidity: Time)(implicit market: Market[A]) {
 //  require(price.getOrElse(BigDecimal(42)) > 0, "Price of portfolio must be positive.")
-
-  private val cumStdNorm = (p: Double) => BigDecimal(Gaussian(0, 1).icdf(p))
 
   lazy val inverse: Portfolio[A] = Portfolio.inverse(this)
 
-  def weights(time: Int): Map[A, BigDecimal] = {
+  def weights(time: Time): Map[A, BigDecimal] = {
     positions.flatMap {
       case (item, amount) =>
         for {
@@ -27,7 +24,8 @@ case class Portfolio[A](positions: Map[A, Long], liquidity: Time)(implicit marke
     }
   }
 
-  def price(time: Int): Option[BigDecimal] =
+  def price(time: Time): Option[BigDecimal] =
+
     sumList(positions.map {
       case (item, amount) =>
         for {
@@ -41,11 +39,11 @@ case class Portfolio[A](positions: Map[A, Long], liquidity: Time)(implicit marke
 //    } yield market.shockItem(item, shock)
 //  }
 
-  def margin(time: Time)(coverage: BigDecimal): Option[BigDecimal] =
+  def margin(time: Time)(coverage: BigDecimal, timeHorizon: Time): Option[BigDecimal] =
     if (isEmpty) Some(BigDecimal(0))
-    else market.margin(time)(this, coverage)
+    else market.margin(time)(this, coverage, timeHorizon)
 
-  def replacementCost(time: Int): Option[BigDecimal] =
+  def replacementCost(time: Time): Option[BigDecimal] =
     sumList(positions.map {
       case (item, amount) if amount > 0 =>
         for {
@@ -56,14 +54,9 @@ case class Portfolio[A](positions: Map[A, Long], liquidity: Time)(implicit marke
         Some(BigDecimal(0))
     }(breakOut))
 
-//  def positionMargin(position: A,
-//                     n: Long,
-//                     coverage: BigDecimal): Option[BigDecimal] =
-//    market.margin(Portfolio(Map(position -> n)), coverage)
-
   val isEmpty: Boolean = positions.isEmpty
 
-  def isShort(time: Int): Option[Boolean] = price(time).map(_ < 0)
+  def isShort(time: Time): Option[Boolean] = price(time).map(_ < 0)
 
   private val implMarket: Market[A] = market
 }

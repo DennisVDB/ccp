@@ -10,22 +10,18 @@ trait CcpProtocol
 
 case class MarginCall(id: RequestId, payment: BigDecimal, maxDelay: Time) extends CcpProtocol
 
-case class MarginCallResponse(counterParty: ActorRef,
-                              id: RequestId,
-                              payment: BigDecimal)
+case class MarginCallResponse(counterParty: ActorRef, id: RequestId, payment: BigDecimal)
     extends CcpProtocol
 
-case class DefaultFundCall(id: RequestId, payment: BigDecimal, maxDelay: Time)
-    extends CcpProtocol
+case class DefaultFundCall(id: RequestId, payment: BigDecimal, maxDelay: Time) extends CcpProtocol
 
-case class DefaultFundCallResponse(counterParty: ActorRef,
-                                   id: RequestId,
-                                   payment: BigDecimal)
+case class DefaultFundCallResponse(counterParty: ActorRef, id: RequestId, payment: BigDecimal)
     extends CcpProtocol
 
 case class UnfundedDefaultFundCall(id: RequestId,
                                    waterfallId: RequestId,
-                                   payment: BigDecimal, maxDelay: Time)
+                                   payment: BigDecimal,
+                                   maxDelay: Time)
     extends CcpProtocol
 
 case class UnfundedDefaultFundCallResponse(counterParty: ActorRef,
@@ -40,28 +36,21 @@ case object Defaulted extends CcpProtocol
 
 case object Paid extends CcpProtocol
 
-case class Waterfall(member: ActorRef, cost: BigDecimal) extends CcpProtocol
+case class Waterfall(member: ActorRef, loss: BigDecimal) extends CcpProtocol
 
-case class CoverWithDefaultingMember(member: ActorRef, cost: BigDecimal)
+case class CoverWithDefaulted(member: ActorRef, loss: BigDecimal) extends CcpProtocol
+
+case class CoverWithSurvivors(member: ActorRef, loss: BigDecimal) extends CcpProtocol
+
+case class CollectUnfundedFunds(member: ActorRef, loss: BigDecimal) extends CcpProtocol
+
+case class CoverWithSurvivorsUnfunded(member: ActorRef, loss: BigDecimal, collected: BigDecimal)
     extends CcpProtocol
 
-case class CoverWithNonDefaultingMembers(member: ActorRef, cost: BigDecimal)
-    extends CcpProtocol
+case class CoverWithFirstLevelEquity(member: ActorRef, loss: BigDecimal) extends CcpProtocol
 
-case class CollectUnfundedFunds(member: ActorRef, cost: BigDecimal)
-    extends CcpProtocol
+case class CoverWithSecondLevelEquity(member: ActorRef, loss: BigDecimal) extends CcpProtocol
 
-case class CoverWithNonDefaultingUnfundedFunds(member: ActorRef,
-                                               cost: BigDecimal,
-                                               collected: BigDecimal)
-    extends CcpProtocol
-
-case class CoverWithFirstLevelEquity(member: ActorRef, cost: BigDecimal)
-    extends CcpProtocol
-
-case class CoverWithSecondLevelEquity(member: ActorRef, cost: BigDecimal)
-    extends CcpProtocol
-
-case class WaterfallResult(costLeft: Option[BigDecimal])
+case class WaterfallResult(lossLeft: Option[BigDecimal])
 
 class RequestId(val id: String) extends AnyVal

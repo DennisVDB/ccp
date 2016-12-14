@@ -1,38 +1,53 @@
 package structure
 
 import akka.actor.{Actor, ActorRef, Props}
+import com.typesafe.scalalogging.Logger
 import structure.Scheduler.{Release, Run, ScheduledMessage}
-import structure.Timed.Time
+import structure.Timed._
 
 import scala.collection.mutable
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 
 /**
-  * Created by dennis on 8/12/16.
+  * Schedules messages so they are sent in the right order.
+  * The simulation has an internal time system that is independent of the computation time and
+  * order the messages are sent. All the timed messages are sent to the scheduler, it then sends the messages out so
+  * that they are received in a chronological order depending on the simulation time.
+  *
+  * @param stepTime duration between the sending of eligible messages.
   */
-case class Scheduler(stepTime: FiniteDuration) extends Actor {
-  private val messages =
-    new mutable.HashMap[Time, mutable.Set[ScheduledMessage]]
-    with mutable.MultiMap[Time, ScheduledMessage]
+case class Scheduler(stepTime: Time) extends Actor {
 
-  private var time: Time = 0
-  private var lastMarginCall: Time = 0
+  // Set of messages to be sent at each time t.
+  private val messages =
+    new mutable.HashMap[Time, mutable.Set[(ActorRef, ScheduledMessage)]]
+    with mutable.MultiMap[Time, (ActorRef, ScheduledMessage)]
+
+  private val logger = Logger("Scheduler")
+
+  private var time: Time = zero
 
   def receive: Receive = {
     case Run =>
+      // Schedule next message release.
       context.system.scheduler.scheduleOnce(stepTime)(self ! Release)
 
     case Release =>
       release()
+
+      // Schedule next message release.
       context.system.scheduler.scheduleOnce(stepTime)(self ! Release)
 
-    case s @ ScheduledMessage(_, TimedMessage(t, _)) =>
-      messages.addBinding(t, s)
+    case m @ ScheduledMessage(_, TimedMessage(t, _)) =>
+      // Store the message for further release.
+      messages.addBinding(t, sender -> m)
   }
 
   /**
     * Sends the messages due, in order of the arrival time.
+    * The eligible messages sent are ordered so that messages left behind at the previous release still
+    * arrive in the right order.
     */
   def release(): Unit = {
     val toSend =
@@ -42,11 +57,19 @@ case class Scheduler(stepTime: FiniteDuration) extends Actor {
         .sortBy(_._1) // Order by time
         .map(_._2) // Select messages to send
 
-    toSend.foreach(_.foreach(m => m.receiver ! m.message)) // Send messages
+    // Send eligible messages.
+    toSend.foreach(_.foreach(sm => {
+      val sender = sm._1
+      val scheduledMessage = sm._2
 
-    (0 to time).foreach(t => messages -= t) // Remove sent messages
+      // Register the original sender as the sender, so the scheduler is transparent.
+      scheduledMessage.to.tell(scheduledMessage.message, sender)
+    }))
 
-    time += 1
+    (zero.toUnit(res) to (time.toUnit(res), 1)).foreach(t =>
+      messages -= FiniteDuration(t.toLong, res)) // Remove sent messages
+
+    time += tick
   }
 }
 
@@ -54,13 +77,17 @@ object Scheduler {
   case object Run
   case object TriggerMarginCalls
   case object Release
-  case class ScheduledMessage(receiver: ActorRef, message: TimedMessage)
+  case class ScheduledMessage(to: ActorRef, message: TimedMessage)
 
-  def scheduleMessageWith(
-      s: ActorRef
-  )(time: Time, to: ActorRef, message: Any): Unit = {
-    s ! ScheduledMessage(to, TimedMessage(time, message))
-  }
+  /**
+    * Helper function for constructing a scheduled message.
+    * @param time time to send the message.
+    * @param to recipient of the message.
+    * @param message message.
+    * @return the message wrapped in a scheduled message.
+    */
+  def scheduledMessage(time: Time, to: ActorRef, message: Any): ScheduledMessage =
+    ScheduledMessage(to, TimedMessage(time, message))
 
   def props(stepTime: FiniteDuration): Props = Props(Scheduler(stepTime))
 }

@@ -7,11 +7,13 @@ scalaVersion := "2.11.8"
 libraryDependencies ++= Seq(
   // other dependencies here
   "org.scalanlp" %% "breeze" % "0.12",
-  "org.typelevel" %% "cats" % "0.8.0",
-  "com.typesafe.akka" %% "akka-actor" % "2.4.12",
+  "org.typelevel" %% "cats" % "0.8.1",
+  "com.typesafe.akka" %% "akka-actor" % "2.4.14",
   "com.typesafe" % "config" % "1.3.1",
   "ch.qos.logback" % "logback-classic" % "1.1.7",
-  "com.typesafe.scala-logging" %% "scala-logging" % "3.5.0"
+  "com.typesafe.scala-logging" %% "scala-logging" % "3.5.0",
+  "com.github.tototoshi" %% "scala-csv" % "1.3.4",
+  "org.spire-math" %% "spire" % "0.11.0"
 )
 
 addCompilerPlugin("org.spire-math" %% "kind-projector" % "0.9.3")

@@ -3,8 +3,8 @@ package structure
 import java.util.UUID
 
 import akka.actor.{Actor, ActorRef, Props}
-import cats.data.Kleisli
-import cats.instances.all._
+import cats.data.{Kleisli, OptionT}
+import cats.implicits._
 import com.typesafe.scalalogging.Logger
 import market.Portfolio
 import structure.Ccp.{Run, _}
@@ -14,6 +14,8 @@ import util.PaymentSystem
 
 import scala.annotation.tailrec
 import scala.collection.breakOut
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.Future
 import scala.language.postfixOps
 import scala.util.Try
 
@@ -29,8 +31,8 @@ import scala.util.Try
   */
 class Ccp[A](
     name: String,
-    memberPortfolios: Map[ActorRef, Portfolio[A]],
-    ccpPortfolios: => Map[ActorRef, Portfolio[A]],
+    memberPortfolios: Map[ActorRef, Portfolio],
+    ccpPortfolios: => Map[ActorRef, Portfolio],
     assets: Map[Time, BigDecimal],
     rules: Rules,
     delays: OperationalDelays,
@@ -142,7 +144,7 @@ class Ccp[A](
   private val ccps: Set[ActorRef] = ccpPortfolios.keys.toSet
   private val allMembers: Set[ActorRef] = members ++ ccps
 
-  private val allPortfolios: Map[ActorRef, Portfolio[A]] = memberPortfolios ++ ccpPortfolios
+  private val allPortfolios: Map[ActorRef, Portfolio] = memberPortfolios ++ ccpPortfolios
 
   private var defaultedMembers: Set[ActorRef] = Set.empty
 
@@ -151,22 +153,25 @@ class Ccp[A](
     * @param t point in time of the prices.
     * @return the portfolio prices of each member.
     */
-  private def portfolioPrices(t: Time): Map[ActorRef, BigDecimal] = {
+  private def portfolioPrices(t: Time): Future[Map[ActorRef, BigDecimal]] = {
     val prices = for {
       (member, portfolio) <- allPortfolios
     } yield (member, portfolio.price(t))
 
+    val pricesO = Future.traverse(prices) { case (m, fo) => fo.value.map(m -> _) }
+
     // Filter out all the "None" portfolio prices.
     // So as to not have options as values.
-    Map(prices.toSeq: _*).collect {
-      case (key, Some(value)) => (key, value)
-    }
+    pricesO.map(p =>
+      Map(p.toSeq: _*).collect {
+        case (k, Some(v)) => (k, v)
+    })
   }
 
   /**
     * Snapshot of the initial margins when setting up the CCP.
     */
-  private val initialMargins: Map[ActorRef, BigDecimal] = {
+  private val initialMargins: Future[Map[ActorRef, BigDecimal]] = {
     val margins =
       if (rules.ccpRules.participatesInMargin) {
         for {
@@ -178,36 +183,42 @@ class Ccp[A](
         } yield member -> portfolio.margin(zero)(rules.marginCoverage, rules.timeHorizon)
       }
 
+    val marginsO = Future.traverse(margins) { case (m, fo) => fo.value.map(m -> _) }
+
     // Filter out all the "None" margins.
-    // So as to not have options as values.
-    Map(margins.toSeq: _*).collect {
-      case (key, Some(value)) => (key, value)
-    }
+    // So as to not have options as values
+    marginsO.map(m =>
+      Map(m.toSeq: _*).collect {
+        case (k, Some(v)) => (k, v)
+    })
   }
 
   /**
     * Posted margins of members.
     */
-  private var margins: Map[ActorRef, BigDecimal] = initialMargins
+  private var margins: Future[Map[ActorRef, BigDecimal]] = initialMargins
 
   /**
     * Snapshot of the default funds when setting up the CCP.
     */
-  private val initDefaultFunds: Map[ActorRef, BigDecimal] = {
+  private val initDefaultFunds: Future[Map[ActorRef, BigDecimal]] = {
     def fundContribution(m: ActorRef) = {
       val funds = for {
-        im <- initialMargins.get(m)
+        im <- OptionT(initialMargins.map(_.get(m)))
         f = im * rules.fundParticipation
       } yield f
 
       m -> funds
     }
 
-    val funds = allMembers.map(fundContribution)
+    val funds = allMembers.map(fundContribution).toMap
 
-    Map(funds.toSeq: _*).collect {
-      case (key, Some(value)) => (key, value)
-    }
+    val fundsO = Future.traverse(funds) { case (m, fo) => fo.value.map(m -> _) }
+
+    fundsO.map(f =>
+      Map(f.toSeq: _*).collect {
+        case (k, Some(v)) => (k, v)
+    })
   }
 
   logger.debug(s"Initial margins: $initialMargins")
@@ -215,7 +226,7 @@ class Ccp[A](
   /**
     * Posted default funds of members.
     */
-  private var defaultFunds: Map[ActorRef, BigDecimal] = initDefaultFunds
+  private var defaultFunds: Future[Map[ActorRef, BigDecimal]] = initDefaultFunds
 
   /**
     * How much unfunded funds can still be called upon.
@@ -229,14 +240,17 @@ class Ccp[A](
     * @param member member for which to compute the pro-rata
     * @return percentage of the default funds of the member ex defaulted members.
     */
-  private def proRataDefaultFunds(member: ActorRef): Option[BigDecimal] = {
-    val survivingMembersFunds = initDefaultFunds.withFilter(e => !defaultedMembers.contains(e._1))
-    val totalFunds = survivingMembersFunds.map(_._2).sum
+  private def proRataDefaultFunds(member: ActorRef): Future[Option[BigDecimal]] = {
+    val survivingMembersFunds =
+      initDefaultFunds.map(_.withFilter(e => !defaultedMembers.contains(e._1)))
 
-    for {
-      part <- initDefaultFunds.get(member)
-      proRata <- Try(part / totalFunds).toOption
-    } yield proRata
+    val totalFundsF = survivingMembersFunds.map(_.map(_._2).sum)
+
+    (for {
+      part <- OptionT(initDefaultFunds.map(_.get(member)))
+      totalFunds <- OptionT.liftF(totalFundsF)
+      proRata <- OptionT.fromOption[Future](Try(part / totalFunds).toOption)
+    } yield proRata).value
   }
 
   /**
@@ -247,13 +261,16 @@ class Ccp[A](
     */
   private def proRataInitialMargins(
       member: ActorRef
-  ): Option[BigDecimal] = {
-    val survivingMembersMargins = initialMargins.withFilter(e => !defaultedMembers.contains(e._1))
-    val totalMargins = survivingMembersMargins.map(_._2).sum
+  ): OptionT[Future, BigDecimal] = {
+    val survivingMembersMargins =
+      initialMargins.map(_.withFilter(e => !defaultedMembers.contains(e._1)))
+
+    val totalMarginsF = survivingMembersMargins.map(_.map(_._2).sum)
 
     for {
-      part <- initialMargins.get(member)
-      proRata <- Try(part / totalMargins).toOption
+      part <- OptionT(initialMargins.map(_.get(member)))
+      totalMargins <- OptionT.liftF(totalMarginsF)
+      proRata <- OptionT.fromOption[Future](Try(part / totalMargins).toOption)
     } yield proRata
   }
 
@@ -294,17 +311,19 @@ class Ccp[A](
     */
   private def memberMarginCall(member: ActorRef, t: Time): Unit =
     for {
-      oldPrice <- portfolioPrices(previousCallTime).get(member)
-      currentPrice <- portfolioPrices(t).get(member)
+      oldPrice <- OptionT(portfolioPrices(previousCallTime).map(_.get(member)))
+      currentPrice <- OptionT(portfolioPrices(t).map(_.get(member)))
 
       variationMargin = oldPrice - currentPrice
 
-      margin <- margins.get(member)
+      margin <- OptionT(margins.map(_.get(member)))
 
       // Update member's margin account
-      _ = margins += (member -> (margin - variationMargin))
+      _ = margins = margins.map(m => m.+((member, margin - variationMargin)))
 
-      initialMargin <- initialMargins.get(member)
+//      _ = margins += (member -> (margin - variationMargin))
+
+      initialMargin <- OptionT(initialMargins.map(_.get(member)))
 
       // Amount below initial margin ...
       // (happens when previously
@@ -343,10 +362,10 @@ class Ccp[A](
   ): Unit =
     for {
       // Update margin with payment
-      currentMargin <- margins.get(member)
-      _ = margins += member -> (currentMargin + payment)
+      currentMargin <- OptionT(margins.map(_.get(member)))
+      _ = margins = margins.map(m => m.+((member, currentMargin + payment)))
 
-      expectedPayment <- expectedMarginPayments.get((member, id))
+      expectedPayment <- OptionT.fromOption[Future](expectedMarginPayments.get((member, id)))
       _ = expectedMarginPayments -= ((member, id))
 
       // Defaulted on payment
@@ -369,10 +388,10 @@ class Ccp[A](
   ): Unit =
     for {
       // Update fund with payment
-      currentDefaultFund <- defaultFunds.get(member)
-      _ = defaultFunds += member -> (currentDefaultFund + payment)
+      currentDefaultFund <- OptionT(defaultFunds.map(_.get(member)))
+      _ = defaultFunds = defaultFunds.map(m => m.+((member, currentDefaultFund + payment)))
 
-      expectedPayment <- expectedDefaultFundPayments.get((member, id))
+      expectedPayment <- OptionT.fromOption[Future](expectedDefaultFundPayments.get((member, id)))
       _ = expectedDefaultFundPayments -= ((member, id))
 
       // Defaulted on payment
@@ -434,7 +453,7 @@ class Ccp[A](
     } else {
       defaultedMembers += member
       for {
-        portfolio <- allPortfolios.get(member)
+        portfolio <- OptionT.fromOption[Future](allPortfolios.get(member))
         replacementCost <- portfolio.replacementCost(t + portfolio.liquidity)
       } yield {
         // Waterfall for loss due incomplete call payment.
@@ -476,19 +495,20 @@ class Ccp[A](
       * @return covered losses
       */
     def coverWithInitialMargin(defaultedMember: ActorRef) =
-      Kleisli[Option, BigDecimal, BigDecimal](loss => {
+      Kleisli[OptionT[Future, ?], BigDecimal, BigDecimal](loss => {
         if (loss <= 0) {
-          Some(0)
+          OptionT.fromOption[Future](Some(0))
         } else {
           // Left after using margin
           val lossAfterMarginUse = for {
-            currentMargin <- margins.get(defaultedMember)
+            currentMargin <- OptionT(margins.map(_.get(defaultedMember)))
 
             // Cannot use negative margin
             lossLeft = loss - (currentMargin max 0)
 
             // Update margins, cannot use more than the current margin
-            _ = margins += defaultedMember -> (currentMargin - (loss min currentMargin))
+            _ = margins =
+              margins.map(m => m.+((defaultedMember, currentMargin - (loss min currentMargin))))
           } yield lossLeft
 
           lossAfterMarginUse.map(_ max 0)
@@ -501,18 +521,19 @@ class Ccp[A](
       * @return covered losses
       */
     def coverWithFund(defaultedMember: ActorRef) =
-      Kleisli[Option, BigDecimal, BigDecimal](loss => {
+      Kleisli[OptionT[Future, ?], BigDecimal, BigDecimal](loss => {
         if (loss <= 0) {
-          Some(0)
+          OptionT.fromOption[Future](Some(0))
         } else {
           // Left after funds use
           val lossAfterFundUse = for {
-            currentFund <- defaultFunds.get(defaultedMember)
+            currentFund <- OptionT(defaultFunds.map(_.get(defaultedMember)))
 
             // Cannot use negative fund
             lossLeft = loss - (currentFund max 0)
 
-            _ = defaultFunds += defaultedMember -> (currentFund - (loss min currentFund))
+            _ = defaultFunds =
+              defaultFunds.map(m => m.+((defaultedMember, currentFund - (loss min currentFund))))
           } yield lossLeft
 
           lossAfterFundUse.map(_ max 0)
@@ -524,12 +545,10 @@ class Ccp[A](
 
     val delayedT = t + (delays.coverWithDefaultedMargin max delays.coverWithDefaultedFund)
 
-    coverWithCollateral(loss) match {
+    coverWithCollateral(loss).value.foreach {
       case Some(lossLeft) =>
         scheduleMessage(delayedT, self, CoverWithFirstLevelEquity(defaultedMember, lossLeft))
-      case None =>
-        // Error
-        scheduleMessage(delayedT, self, WaterfallResult(None))
+      case None => scheduleMessage(delayedT, self, WaterfallResult(None))
     }
   }
 
@@ -549,27 +568,29 @@ class Ccp[A](
       * @return losses after covering with margins.
       */
     def coverWithSurvivingMargin(defaultedMember: ActorRef) =
-      (loss: BigDecimal) => {
+      Kleisli[Future, BigDecimal, BigDecimal](loss => {
         if (loss <= 0) {
-          BigDecimal(0)
+          Future.successful(BigDecimal(0))
         } else {
           val survivingMemberMargins =
-            margins.withFilter(entry => !defaultedMembers.contains(entry._1))
-          val totalMargins = survivingMemberMargins.map(_._2).sum
+            margins.map(_.withFilter(entry => !defaultedMembers.contains(entry._1)))
+
+          val totalMarginsF = survivingMemberMargins.map(_.map(_._2).sum)
 
           val survivingMembers = allMembers -- defaultedMembers
 
           survivingMembers.foreach(
             member => {
               for {
-                currentMargin <- margins.get(member)
+                currentMargin <- OptionT(margins.map(_.get(member)))
                 proRata <- proRataInitialMargins(member)
+                totalMargins <- OptionT.liftF(totalMarginsF)
                 payment = (loss min totalMargins) * proRata
 
                 // Needs to pay
                 if payment > 0
 
-                _ = margins += member -> (currentMargin - payment)
+                _ = margins = margins.map(m => m.+((member, currentMargin - payment)))
 
                 id = generateUuid
                 _ = expectedMarginPayments += (member, id) -> payment
@@ -580,9 +601,9 @@ class Ccp[A](
             }
           )
 
-          (loss - totalMargins) max 0
+          totalMarginsF.map(totalMargins => (loss - totalMargins) max 0)
         }
-      }
+      })
 
     /**
       * Covers the losses with the surviving members funds.
@@ -590,26 +611,28 @@ class Ccp[A](
       * @return losses after covering with funds.
       */
     def coverWithNonDefaultingFunds(defaultedMember: ActorRef) =
-      (loss: BigDecimal) => {
+      Kleisli[Future, BigDecimal, BigDecimal](loss => {
         if (loss <= 0) {
-          BigDecimal(0)
+          Future.successful(BigDecimal(0))
         } else {
           val survivingMemberFunds =
-            defaultFunds.withFilter(entry => !defaultedMembers.contains(entry._1))
-          val totalFunds = survivingMemberFunds.map(_._2).sum
+            defaultFunds.map(_.withFilter(entry => !defaultedMembers.contains(entry._1)))
+          val totalFundsF = survivingMemberFunds.map(_.map(_._2).sum)
 
           val survivingMembers = allMembers -- defaultedMembers
 
           survivingMembers.foreach(
             member => {
               for {
-                currentFund <- defaultFunds.get(member)
-                proRata <- proRataDefaultFunds(member)
+                currentFund <- OptionT(defaultFunds.map(_.get(member)))
+                proRata <- OptionT(proRataDefaultFunds(member))
+                totalFunds <- OptionT.liftF(totalFundsF)
                 payment = (loss min totalFunds) * proRata
 
                 // Needs to pay
                 if payment > 0
-                _ = defaultFunds += member -> (currentFund - payment)
+
+                _ = defaultFunds = defaultFunds.map(m => m.+((member, currentFund - payment)))
 
                 id = generateUuid
                 _ = expectedDefaultFundPayments += (member, id) -> payment
@@ -620,18 +643,20 @@ class Ccp[A](
             }
           )
 
-          (loss - totalFunds) max 0
+          totalFundsF.map(totalFunds => (loss - totalFunds) max 0)
         }
-      }
+      })
 
     val coverWithSurvivors = coverWithNonDefaultingFunds(defaultedMember) andThen
         coverWithSurvivingMargin(defaultedMember)
 
-    val lossLeft = coverWithSurvivors(loss)
+    val lossLeftF = coverWithSurvivors(loss)
 
-    scheduleMessage(t + (delays.coverWithSurvivorsMargins max delays.coverWithSurvivorsFunds),
-                    self,
-                    CollectUnfundedFunds(defaultedMember, lossLeft))
+    lossLeftF.foreach(
+      lossLeft =>
+        scheduleMessage(t + (delays.coverWithSurvivorsMargins max delays.coverWithSurvivorsFunds),
+                        self,
+                        CollectUnfundedFunds(defaultedMember, lossLeft)))
   }
 
   /**
@@ -650,8 +675,8 @@ class Ccp[A](
 
       val payments = survivingMember.map(member => {
         for {
-          fundLeft <- unfundedFundsLeft.get(member)
-          proRata <- proRataDefaultFunds(member)
+          fundLeft <- OptionT.fromOption[Future](unfundedFundsLeft.get(member))
+          proRata <- OptionT(proRataDefaultFunds(member))
 
           // Don't call more than allowed
           payment = (loss * proRata) min fundLeft
@@ -662,9 +687,10 @@ class Ccp[A](
           id = generateUuid
           _ = expectedDefaultFundPayments += (member, id) -> payment
 
-          _ = scheduleMessage(t + delays.computeSurvivorsUnfunded,
-                              member,
-                              UnfundedDefaultFundCall(id, waterfallId, payment, rules.maxRecapPeriod))
+          _ = scheduleMessage(
+            t + delays.computeSurvivorsUnfunded,
+            member,
+            UnfundedDefaultFundCall(id, waterfallId, payment, rules.maxRecapPeriod))
 
           _ = unfundedFundsLeft += member -> (fundLeft - payment)
         } yield payment
@@ -781,8 +807,8 @@ class Ccp[A](
 
 object Ccp {
   def props[A](name: String,
-               memberPortfolios: Map[ActorRef, Portfolio[A]],
-               ccpPortfolios: => Map[ActorRef, Portfolio[A]],
+               memberPortfolios: Map[ActorRef, Portfolio],
+               ccpPortfolios: => Map[ActorRef, Portfolio],
                assets: Map[Time, BigDecimal],
                rules: Rules,
                operationalDelays: OperationalDelays,

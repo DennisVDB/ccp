@@ -24,23 +24,24 @@ object Main extends App {
   val pos1 = Security("pos1")
   val pos2 = Security("pos2")
 
-  implicit val market = Market[Security](
-    prices = Map(pos1 -> BigDecimal("10000"), pos2 -> BigDecimal("5000")),
-    indexes = Map(pos1 -> 0, pos2 -> 1),
-    retDistr = MultivariateGaussian(
-      DenseVector(0.0, 0.0), //DenseVector(0.0002, 0.00015),
-      DenseMatrix((0.5, 0.0), (0.0, 0.2))
-    ),
-    scaling = 100
-  )
+  val market = system.actorOf(
+    Market.props(
+      prices = Map(pos1 -> BigDecimal("10000"), pos2 -> BigDecimal("5000")),
+      indexes = Map(pos1 -> 0, pos2 -> 1),
+      retDistr = MultivariateGaussian(
+        DenseVector(0.0, 0.0), //DenseVector(0.0002, 0.00015),
+        DenseMatrix((0.5, 0.0), (0.0, 0.2))
+      ),
+      scaling = 100
+    ))
 
-  val longPortfolio: Portfolio[Security] =
-    Portfolio(positions = Map((pos1, 1)), liquidity = 1 minute)
+  val longPortfolio: Portfolio =
+    Portfolio(positions = Map((pos1, 1)), liquidity = 1 minute, market)
 
   val shortPortfolio = longPortfolio.inverse
 
   val emptyPortfolio =
-    Portfolio(positions = Map.empty[Security, Int], liquidity = 0 minutes)
+    Portfolio(positions = Map.empty[Security, Int], liquidity = 0 minutes, market)
 
   implicit val scheduler = system.actorOf(Scheduler.props(1 milliseconds))
 
@@ -104,7 +105,7 @@ object Main extends App {
         member3 -> longPortfolio,
         member4 -> shortPortfolio
       ),
-      ccpPortfolios = Map.empty[ActorRef, Portfolio[Security]], // Map(ccp2 -> longPortfolio),
+      ccpPortfolios = Map.empty[ActorRef, Portfolio], // Map(ccp2 -> longPortfolio),
       assets = Map((0 minutes) -> BigDecimal(100),
                    (1 minute) -> BigDecimal(400),
                    (3 minutes) -> BigDecimal(1000)),
@@ -185,7 +186,7 @@ object Main extends App {
   println(s"member4 as $member4")
 
   val scenario = system.actorOf(
-    Scenario.props(ccps = Set(ccp1), timeHorizon = 1 day, scheduler = scheduler)
+    Scenario.props(ccps = Set(ccp1, ccp2), timeHorizon = 1 day, scheduler = scheduler)
   )
 
   Thread.sleep(2000)

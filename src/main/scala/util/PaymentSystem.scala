@@ -31,9 +31,9 @@ trait PaymentSystem {
       s <- State.get
     } yield TimedPayment(payment - s.paymentLeft, s.currentDelay)
 
-    val t = s.run(WorkState(assets, payment, zero)).value
+    val (ws, tp) = s.run(WorkState(assets, payment, zero)).value
 
-    Update(t._1.assets, t._2)
+    Update(ws.assets, tp)
   }
 
   /**

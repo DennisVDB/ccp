@@ -2,39 +2,49 @@ package market
 
 import java.io.File
 
+import akka.actor.{Actor, Props}
+import akka.pattern.pipe
 import breeze.linalg.{Axis, DenseVector}
 import breeze.stats.distributions.{Gaussian, MultivariateGaussian}
+import cats.data.OptionT
 import cats.implicits._
 import com.github.tototoshi.csv.CSVWriter
 import com.typesafe.scalalogging.Logger
-import market.Market.{Index, Price}
+import market.Market.{Index, Margin, Price}
 import spire.implicits._
 import spire.math
-import structure.Timed.{Time, _}
+import structure.Timed.{Time, res, _}
 
 import scala.collection._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.concurrent.duration._
+
 /**
   * Provides the prices for any point in time.
   *
   * @param prices the prices at time 0.
   * @param indexes the indexes of the instruments in the covariance matrix.
   * @param retDistr the probability distribution of the instruments' prices.
-  * @tparam A type of the instruments.
   */
-case class Market[A](prices: Map[A, Price],
-                     indexes: Map[A, Index],
-                     retDistr: MultivariateGaussian,
-                     scaling: Int) {
+case class Market(prices: Map[Security, BigDecimal],
+                  indexes: Map[Security, Index],
+                  retDistr: MultivariateGaussian,
+                  scaling: Int)
+    extends Actor {
   private val icdf = (p: Double) => BigDecimal(Gaussian(0, 1).icdf(p))
 
-  private val generatedPrices = concurrent.TrieMap(FiniteDuration(0, res) -> prices)
+  private var generatedPrices = Map(FiniteDuration(0, res) -> prices)
 
   private val logger = Logger("Market")
 
   private val f = new File("out.csv")
+
+  def receive: Receive = {
+    case Price(i, t) => sender ! price(i, t)
+    case Margin(portfolio, coverage, timeHorizon, t) =>
+      margin(portfolio, coverage, timeHorizon, t).value pipeTo sender
+  }
 
   /**
     * Provide the price for the instrument at the given time.
@@ -42,7 +52,7 @@ case class Market[A](prices: Map[A, Price],
     * @param instrument instrument
     * @return the price for the instrument at the given time.
     */
-  def price(time: Time)(instrument: A): Option[Price] = {
+  private def price(instrument: Security, time: Time): Option[BigDecimal] = {
 
     /**
       * Helper function for generating prices for a specific point in time.
@@ -50,10 +60,10 @@ case class Market[A](prices: Map[A, Price],
       * @param t point in time of prices.
       * @return prices for point in time t.
       */
-    def generatePrices(t: Time): Option[Map[A, Price]] = {
+    def generatePrices(t: Time): Option[Map[Security, BigDecimal]] = {
       val rs = retDistr.draw().map(BigDecimal(_))
 
-      val newPs = indexes.keys
+      val newPsO = indexes.keys
         .map(a =>
           for {
             // If the data does not exist, recursively generate it.
@@ -65,32 +75,32 @@ case class Market[A](prices: Map[A, Price],
           } yield {
             // Store the generated past data.
             // Might just overwrite the same if it already existed.
-            generatedPrices.put(t - tick, ps)
+            generatedPrices += (t - tick) -> ps
 
             // Price cannot be negative
             a -> ((p * (1 + (r / scaling))) max 0)
         })
         .toList
-        .sequence[Option, (A, Price)]
+        .sequence[Option, (Security, BigDecimal)]
         .map(_.toMap)
 
       // Store the new generated data.
-      newPs.map(generatedPrices.put(t, _))
+      newPsO.foreach(newPs => generatedPrices += t -> newPs)
 
       for {
-        ps <- newPs
+        newPs <- newPsO
       } {
         Future {
           val writer = CSVWriter.open(f, append = true)
           val stringifiedTime = t.toUnit(res).toString
-          val stringifiedPs = ps.values.map(_.toString)
+          val stringifiedPs = newPs.values.map(_.toString)
           val row = Iterable(stringifiedTime) ++ stringifiedPs
           writer.writeRow(row.toSeq)
           writer.close()
         }
       }
 
-      newPs
+      newPsO
     }
 
     generatedPrices.get(time) match {
@@ -112,11 +122,10 @@ case class Market[A](prices: Map[A, Price],
     * @param coverage coverage needed.
     * @return Amount of margin needed.
     */
-  def margin(time: Time)(portfolio: Portfolio[A],
-                         coverage: BigDecimal,
-                         timeHorizon: Time): Option[BigDecimal] = {
-    val foo = timeHorizon.toUnit(res)
-
+  private def margin(portfolio: Portfolio,
+                     coverage: BigDecimal,
+                     timeHorizon: Time,
+                     time: Time): OptionT[Future, BigDecimal] = {
     // Set of positions in the portfolio.
     val pPositions = portfolio.positions.keys.toSet
 
@@ -127,12 +136,12 @@ case class Market[A](prices: Map[A, Price],
     val indexesToStrip = indexes.filterNot(i => pIndexes.contains(i._1)).values
 
     if (pIndexes.size != portfolio.positions.size)
-      None // Market does not contain all portfolio elements.
+      throw new IllegalArgumentException("Portfolio is broken.") // Market does not contain all portfolio elements.
     else {
       for {
         price <- portfolio.price(time)
 
-        pWeights = portfolio.weights(time).values
+        pWeights <- OptionT.liftF(portfolio.weights(time).map(_.values))
 
         weightsVec = DenseVector(pWeights.toList: _*).map(_.doubleValue).asDenseMatrix
 
@@ -181,6 +190,13 @@ case class Market[A](prices: Map[A, Price],
 }
 
 object Market {
-  type Price = BigDecimal
   type Index = Int
+
+  case class Price(instrument: Security, t: Time)
+  case class Margin(portfolio: Portfolio, coverage: BigDecimal, timeHorizon: Time, t: Time)
+
+  def props(prices: Map[Security, BigDecimal],
+            indexes: Map[Security, Index],
+            retDistr: MultivariateGaussian,
+            scaling: Int): Props = Props(Market(prices, indexes, retDistr, scaling))
 }

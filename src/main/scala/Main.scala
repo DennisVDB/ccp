@@ -4,10 +4,12 @@ import breeze.linalg.{DenseMatrix, DenseVector}
 import breeze.stats.distributions.MultivariateGaussian
 import com.typesafe.config.ConfigFactory
 import market.{Market, Portfolio, Security}
-import structure.Ccp._
 import structure.Scenario.Run
 import structure.Timed.Time
 import structure._
+import structure.ccp.Ccp._
+import structure.ccp.Waterfall.{End, Start, _}
+import structure.ccp.{Ccp, Waterfall}
 
 import scala.concurrent.duration._
 import scala.language.postfixOps
@@ -30,7 +32,7 @@ object Main extends App {
       indexes = Map(pos1 -> 0, pos2 -> 1),
       retDistr = MultivariateGaussian(
         DenseVector(0.0, 0.0), //DenseVector(0.0002, 0.00015),
-        DenseMatrix((0.5, 0.0), (0.0, 0.2))
+        DenseMatrix((1.0, 0.0), (0.0, 0.2))
       ),
       scaling = 100
     ))
@@ -43,7 +45,7 @@ object Main extends App {
   val emptyPortfolio =
     Portfolio(positions = Map.empty[Security, Int], liquidity = 0 minutes, market)
 
-  implicit val scheduler = system.actorOf(Scheduler.props(1 milliseconds))
+  implicit val scheduler = system.actorOf(Scheduler.props(50 milliseconds))
 
   val member1 =
     system.actorOf(
@@ -97,9 +99,26 @@ object Main extends App {
       )
     )
 
+  val arnsdorfWaterfall = Waterfall(
+    Map(Start -> Defaulted,
+        Defaulted -> FirstLevelEquity,
+        FirstLevelEquity -> Survivors,
+        Survivors -> Unfunded,
+        Unfunded -> SecondLevelEquity,
+        SecondLevelEquity -> End))
+
+  val isdaWaterfall = Waterfall(
+    Map(Start -> Defaulted,
+        Defaulted -> FirstLevelEquity,
+        FirstLevelEquity -> Survivors,
+        Survivors -> SecondLevelEquity,
+        SecondLevelEquity -> VMGH,
+        VMGH -> End))
+
   lazy val ccp1: ActorRef = system.actorOf(
     Ccp.props[Security](
       name = "ccp1",
+      waterfall = isdaWaterfall,
       memberPortfolios = Map(
 //        member1 -> longPortfolio,
         member3 -> longPortfolio,
@@ -132,6 +151,7 @@ object Main extends App {
         coverWithSurvivorsFunds = 15 minutes,
         computeSurvivorsUnfunded = 15 minutes,
         coverWithSurvivorsUnfunded = 15 minutes,
+        coverWithVMGH = 15 minutes,
         coverWithFirstLevelEquity = 15 minutes,
         coverWithSecondLevelEquity = 15 minutes
       ),
@@ -142,6 +162,7 @@ object Main extends App {
   lazy val ccp2: ActorRef = system.actorOf(
     Ccp.props[Security](
       name = "ccp2",
+      waterfall = isdaWaterfall,
       memberPortfolios =
         Map(member1 -> longPortfolio, member3 -> longPortfolio, member4 -> shortPortfolio),
       ccpPortfolios = Map(ccp2 -> longPortfolio),
@@ -171,6 +192,7 @@ object Main extends App {
         coverWithSurvivorsFunds = 15 minutes,
         computeSurvivorsUnfunded = 15 minutes,
         coverWithSurvivorsUnfunded = 15 minutes,
+        coverWithVMGH = 15 minutes,
         coverWithFirstLevelEquity = 15 minutes,
         coverWithSecondLevelEquity = 15 minutes
       ),
@@ -186,7 +208,7 @@ object Main extends App {
   println(s"member4 as $member4")
 
   val scenario = system.actorOf(
-    Scenario.props(ccps = Set(ccp1, ccp2), timeHorizon = 1 day, scheduler = scheduler)
+    Scenario.props(ccps = Set(ccp1), timeHorizon = 5 days, scheduler = scheduler)
   )
 
   Thread.sleep(2000)

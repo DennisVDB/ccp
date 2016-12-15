@@ -3,12 +3,12 @@ package structure
 import java.io.File
 
 import akka.actor.{Actor, ActorRef, Props}
-import akka.event.LoggingReceive
 import com.github.tototoshi.csv.CSVWriter
 import com.typesafe.scalalogging.Logger
 import structure.Member.Delay
 import structure.Scheduler.scheduledMessage
 import structure.Timed._
+import structure.ccp._
 import util.PaymentSystem
 
 import scala.concurrent.ExecutionContext.Implicits.global
@@ -30,7 +30,7 @@ case class Member(name: String, assets: Map[Time, BigDecimal], delays: Delay, sc
   private val f = new File(s"$name.csv")
   private var _assets = assets
 
-  override def receive: Receive = LoggingReceive {
+  override def receive: Receive = {
     case Paid => sender ! totalPaid
 
     case TimedMessage(t, m) =>
@@ -47,7 +47,7 @@ case class Member(name: String, assets: Map[Time, BigDecimal], delays: Delay, sc
                    t + u.timedPayment.delay + delays.callHandling)
             scheduleMessage(t + u.timedPayment.delay + delays.callHandling,
                             sender,
-                            MarginCallResponse(self, id, u.timedPayment.payment))
+                            MarginCallResponse(id, self, u.timedPayment.payment))
           }
 
         case DefaultFundCall(id, payment, maxDelay) =>
@@ -55,7 +55,7 @@ case class Member(name: String, assets: Map[Time, BigDecimal], delays: Delay, sc
           update(u.assets, u.timedPayment.payment, t + u.timedPayment.delay + delays.callHandling)
           scheduleMessage(t + u.timedPayment.delay + delays.callHandling,
                           sender,
-                          DefaultFundCallResponse(self, id, u.timedPayment.payment))
+                          DefaultFundCallResponse(id, self, u.timedPayment.payment))
 
         case UnfundedDefaultFundCall(id, waterfallId, payment, maxDelay) =>
           val u = handlePayment(_assets, payment, maxDelay - delays.callHandling)
@@ -63,7 +63,7 @@ case class Member(name: String, assets: Map[Time, BigDecimal], delays: Delay, sc
           scheduleMessage(
             t + u.timedPayment.delay + delays.callHandling,
             sender,
-            UnfundedDefaultFundCallResponse(self, id, waterfallId, u.timedPayment.payment))
+            UnfundedDefaultFundCallResponse(waterfallId, id, self, u.timedPayment.payment))
 
         // TODO Defaulted and Paid
       }

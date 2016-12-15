@@ -31,13 +31,9 @@ case class Scheduler(stepTime: Time) extends Actor {
   def receive: Receive = {
     case Run =>
       // Schedule next message release.
-      context.system.scheduler.scheduleOnce(stepTime)(self ! Release)
+      context.system.scheduler.schedule(stepTime, stepTime)(self ! Release)
 
-    case Release =>
-      release()
-
-      // Schedule next message release.
-      context.system.scheduler.scheduleOnce(stepTime)(self ! Release)
+    case Release => if (messages.nonEmpty) release()
 
     case m @ ScheduledMessage(_, TimedMessage(t, _)) =>
       // Store the message for further release.
@@ -49,6 +45,7 @@ case class Scheduler(stepTime: Time) extends Actor {
     * The eligible messages sent are ordered so that messages left behind at the previous release still
     * arrive in the right order.
     */
+  @inline
   def release(): Unit = {
     val toSend =
       messages

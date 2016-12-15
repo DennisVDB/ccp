@@ -3,6 +3,7 @@ package structure
 import akka.actor.{Actor, ActorRef, Props}
 import structure.Scheduler.scheduledMessage
 import structure.Timed.Time
+import structure.ccp.Ccp
 
 /**
   * Creates a scenario in which clearinghouses and their members can run until the timeHorizon.

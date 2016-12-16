@@ -7,6 +7,7 @@ scalaVersion := "2.11.8"
 libraryDependencies ++= Seq(
   // other dependencies here
   "org.scalanlp" %% "breeze" % "0.12",
+  "org.scalanlp" %% "breeze-natives" % "0.12",
   "org.typelevel" %% "cats" % "0.8.1",
   "com.typesafe.akka" %% "akka-actor" % "2.4.14",
   "com.typesafe" % "config" % "1.3.1",

@@ -25,14 +25,26 @@ object Main extends App {
 
   val pos1 = Security("pos1")
   val pos2 = Security("pos2")
+  val pos3 = Security("pos3")
+
+//  val market = system.actorOf(
+//    Market.props(
+//      prices = Map(pos1 -> BigDecimal("10000"), pos2 -> BigDecimal("5000")),
+//      indexes = Map(pos1 -> 0, pos2 -> 1),
+//      retDistr = MultivariateGaussian(
+//        DenseVector(0.0, 0.0), //DenseVector(0.0002, 0.00015),
+//        DenseMatrix((1.0, 0.0), (0.0, 0.2))
+//      ),
+//      scaling = 100
+//    ))
 
   val market = system.actorOf(
     Market.props(
-      prices = Map(pos1 -> BigDecimal("10000"), pos2 -> BigDecimal("5000")),
-      indexes = Map(pos1 -> 0, pos2 -> 1),
+      prices = Map(pos1 -> BigDecimal("10000"), pos2 -> BigDecimal("5000"), pos3 -> BigDecimal("3000")),
+      indexes = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2),
       retDistr = MultivariateGaussian(
-        DenseVector(0.0, 0.0), //DenseVector(0.0002, 0.00015),
-        DenseMatrix((1.0, 0.0), (0.0, 0.2))
+        DenseVector(0.0, 0.0, 0.0), //DenseVector(0.0002, 0.00015),
+        DenseMatrix((1.0, 0.0, 0.0), (0.0, 0.5, 0.0), (0.0, 0.0, 3.0))
       ),
       scaling = 100
     ))
@@ -162,7 +174,7 @@ object Main extends App {
   lazy val ccp2: ActorRef = system.actorOf(
     Ccp.props[Security](
       name = "ccp2",
-      waterfall = isdaWaterfall,
+      waterfall = arnsdorfWaterfall,
       memberPortfolios =
         Map(member1 -> longPortfolio, member3 -> longPortfolio, member4 -> shortPortfolio),
       ccpPortfolios = Map(ccp2 -> longPortfolio),
@@ -208,7 +220,7 @@ object Main extends App {
   println(s"member4 as $member4")
 
   val scenario = system.actorOf(
-    Scenario.props(ccps = Set(ccp1), timeHorizon = 5 days, scheduler = scheduler)
+    Scenario.props(ccps = Set(ccp1, ccp2), timeHorizon = 5 days, scheduler = scheduler)
   )
 
   Thread.sleep(2000)

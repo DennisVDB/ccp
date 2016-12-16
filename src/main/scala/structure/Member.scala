@@ -39,7 +39,10 @@ case class Member(name: String, assets: Map[Time, BigDecimal], delays: Delay, sc
 
       m match {
         case MarginCall(id, payment, maxDelay) =>
-          if (payment < 0) updateAssets(-payment)
+          if (payment < 0) {
+            updateAssets(-payment, t)
+            scheduleMessage(t, sender, MarginCallResponse(id, self, payment))
+          }
           else {
             val u = handlePayment(_assets, payment, maxDelay - delays.callHandling)
             update(u.assets,
@@ -77,14 +80,7 @@ case class Member(name: String, assets: Map[Time, BigDecimal], delays: Delay, sc
   private def update(assets: Map[Time, BigDecimal], payment: BigDecimal, t: Time): Unit = {
     _assets = assets
 
-    Future {
-      val writer = CSVWriter.open(f, append = true)
-      val stringifiedTime = t.toUnit(res).toString
-      val stringifiedPayment = assets.values.sum.toString
-      val row = List(stringifiedTime, stringifiedPayment)
-      writer.writeRow(row)
-      writer.close()
-    }
+    writeToCsv(t, -payment)
 
     totalPaid += payment
   }
@@ -93,12 +89,25 @@ case class Member(name: String, assets: Map[Time, BigDecimal], delays: Delay, sc
     * Updates the assets with the payment. Liquidity is assumed to be 0.
     * @param payment payment to add.
     */
-  private def updateAssets(payment: BigDecimal): Unit = {
+  private def updateAssets(payment: BigDecimal, t: Time): Unit = {
+    writeToCsv(t, payment)
+
     for {
       currentAmount <- _assets.get(zero)
 
       _ = _assets += zero -> (currentAmount + payment)
     } yield ()
+  }
+
+  private def writeToCsv(t: Time, payment: BigDecimal): Unit = {
+    Future {
+      val writer = CSVWriter.open(f, append = true)
+      val stringifiedTime = t.toUnit(res).toString
+      val stringifiedPayment = payment //assets.values.sum.toString
+      val row = List(stringifiedTime, stringifiedPayment)
+      writer.writeRow(row)
+      writer.close()
+    }
   }
 
   /**

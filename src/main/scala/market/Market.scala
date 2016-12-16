@@ -90,14 +90,12 @@ case class Market(prices: Map[Security, BigDecimal],
       for {
         newPs <- newPsO
       } {
-        Future {
           val writer = CSVWriter.open(f, append = true)
           val stringifiedTime = t.toUnit(res).toString
           val stringifiedPs = newPs.values.map(_.toString)
           val row = Iterable(stringifiedTime) ++ stringifiedPs
           writer.writeRow(row.toSeq)
           writer.close()
-        }
       }
 
       newPsO

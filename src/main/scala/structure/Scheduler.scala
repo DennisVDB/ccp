@@ -45,23 +45,22 @@ case class Scheduler(stepTime: Time) extends Actor {
     * The eligible messages sent are ordered so that messages left behind at the previous release still
     * arrive in the right order.
     */
-  @inline
   def release(): Unit = {
     val toSend =
       messages
         .filterKeys(_ <= time)
         .toSeq
         .sortBy(_._1) // Order by time
-        .map(_._2) // Select messages to send
+        .flatMap(_._2) // Select messages to send
 
     // Send eligible messages.
-    toSend.foreach(_.foreach(sm => {
+    toSend.foreach(sm => {
       val sender = sm._1
       val scheduledMessage = sm._2
 
       // Register the original sender as the sender, so the scheduler is transparent.
       scheduledMessage.to.tell(scheduledMessage.message, sender)
-    }))
+    })
 
     (zero.toUnit(res) to (time.toUnit(res), 1)).foreach(t =>
       messages -= FiniteDuration(t.toLong, res)) // Remove sent messages

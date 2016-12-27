@@ -5,7 +5,6 @@ import breeze.stats.distributions.MultivariateGaussian
 import com.typesafe.config.ConfigFactory
 import market.{Market, Portfolio, Security}
 import structure.Scenario.Run
-import structure.Timed.Time
 import structure._
 import structure.ccp.Ccp._
 import structure.ccp.Waterfall.{End, Start, _}
@@ -26,6 +25,7 @@ object Main extends App {
   val pos1 = Security("pos1")
   val pos2 = Security("pos2")
   val pos3 = Security("pos3")
+  val sp500 = Security("sp500")
 
 //  val market = system.actorOf(
 //    Market.props(
@@ -40,35 +40,30 @@ object Main extends App {
 
   val market = system.actorOf(
     Market.props(
-      prices = Map(pos1 -> BigDecimal("10000"), pos2 -> BigDecimal("5000"), pos3 -> BigDecimal("3000")),
-      indexes = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2),
+      prices =
+        Map(pos1 -> BigDecimal("10000"), pos2 -> BigDecimal("5000"), pos3 -> BigDecimal("3000"), sp500 -> BigDecimal("100")),
+      indexes = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3),
       retDistr = MultivariateGaussian(
-        DenseVector(0.0, 0.0, 0.0), //DenseVector(0.0002, 0.00015),
-        DenseMatrix((1.0, 0.0, 0.0), (0.0, 0.5, 0.0), (0.0, 0.0, 3.0))
+        DenseVector(0.0, 0.0, 0.0, 0.0),
+        DenseMatrix((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
       ),
       scaling = 100
     ))
 
-  val longPortfolio: Portfolio =
-    Portfolio(positions = Map((pos1, 1)), liquidity = 1 minute, market)
-
+  val longPortfolio = Portfolio(Map(pos1 -> 1), market)
+  val longPortfolio3 = Portfolio(Map(pos1 -> 1, pos2 -> -30, pos3 -> 100), market)
   val shortPortfolio = longPortfolio.inverse
+  val emptyPortfolio = Portfolio(Map.empty[Security, BigDecimal], market)
+  val capital = Portfolio(Map(sp500 -> 1), market)
 
-  val emptyPortfolio =
-    Portfolio(positions = Map.empty[Security, Int], liquidity = 0 minutes, market)
-
-  implicit val scheduler = system.actorOf(Scheduler.props(50 milliseconds))
+  implicit val scheduler = system.actorOf(Scheduler.props(15 milliseconds))
 
   val member1 =
     system.actorOf(
       Member.props(
         name = "member 1",
-        assets = Map(
-          (0 minutes) -> BigDecimal(100),
-          (1 minute) -> BigDecimal(400),
-          (3 minutes) -> BigDecimal(1000)
-        ),
-        delays = Member.Delay(callHandling = 15 minutes),
+        capital = capital,
+        market = market,
         scheduler = scheduler
       )
     )
@@ -77,12 +72,8 @@ object Main extends App {
     system.actorOf(
       Member.props(
         name = "member 2",
-        assets = Map(
-          (0 minutes) -> BigDecimal(100),
-          (1 minute) -> BigDecimal(400),
-          (3 minutes) -> BigDecimal(1000)
-        ),
-        delays = Member.Delay(callHandling = 15 minutes),
+        capital = capital,
+        market = market,
         scheduler = scheduler
       )
     )
@@ -91,8 +82,8 @@ object Main extends App {
     system.actorOf(
       Member.props(
         name = "member 3",
-        assets = Map.empty[Time, BigDecimal],
-        delays = Member.Delay(callHandling = 15 minutes),
+        capital = emptyPortfolio,
+        market = market,
         scheduler = scheduler
       )
     )
@@ -101,12 +92,8 @@ object Main extends App {
     system.actorOf(
       Member.props(
         name = "member 4",
-        assets = Map(
-          (0 minutes) -> BigDecimal(100),
-          (1 minute) -> BigDecimal(400),
-          (3 minutes) -> BigDecimal(1000)
-        ),
-        delays = Member.Delay(callHandling = 15 minutes),
+        capital = capital,
+        market = market,
         scheduler = scheduler
       )
     )
@@ -130,16 +117,14 @@ object Main extends App {
   lazy val ccp1: ActorRef = system.actorOf(
     Ccp.props[Security](
       name = "ccp1",
-      waterfall = isdaWaterfall,
+      waterfall = arnsdorfWaterfall,
       memberPortfolios = Map(
-//        member1 -> longPortfolio,
-        member3 -> longPortfolio,
-        member4 -> shortPortfolio
+        member1 -> longPortfolio
+//        member3 -> longPortfolio,
+//        member4 -> shortPortfolio
       ),
       ccpPortfolios = Map.empty[ActorRef, Portfolio], // Map(ccp2 -> longPortfolio),
-      assets = Map((0 minutes) -> BigDecimal(100),
-                   (1 minute) -> BigDecimal(400),
-                   (3 minutes) -> BigDecimal(1000)),
+      capital = capital,
       rules = Rules(
         callEvery = 1 hour,
         maxCallPeriod = 480 minutes,
@@ -157,8 +142,8 @@ object Main extends App {
       ),
       operationalDelays = OperationalDelays(
         callHandling = 15 minutes,
-        coverWithDefaultedMargin = 15 minutes,
-        coverWithDefaultedFund = 15 minutes,
+        coverWithMargin = 15 minutes,
+        coverWithFund = 15 minutes,
         coverWithSurvivorsMargins = 15 minutes,
         coverWithSurvivorsFunds = 15 minutes,
         computeSurvivorsUnfunded = 15 minutes,
@@ -167,6 +152,7 @@ object Main extends App {
         coverWithFirstLevelEquity = 15 minutes,
         coverWithSecondLevelEquity = 15 minutes
       ),
+      market = market,
       scheduler = scheduler
     )
   )
@@ -178,9 +164,7 @@ object Main extends App {
       memberPortfolios =
         Map(member1 -> longPortfolio, member3 -> longPortfolio, member4 -> shortPortfolio),
       ccpPortfolios = Map(ccp2 -> longPortfolio),
-      assets = Map((0 minutes) -> BigDecimal(100),
-                   (1 minute) -> BigDecimal(400),
-                   (3 minutes) -> BigDecimal(1000)),
+      capital = capital,
       rules = Rules(
         callEvery = 1 hour,
         maxCallPeriod = 480 minutes,
@@ -198,8 +182,8 @@ object Main extends App {
       ),
       operationalDelays = OperationalDelays(
         callHandling = 15 minutes,
-        coverWithDefaultedMargin = 15 minutes,
-        coverWithDefaultedFund = 15 minutes,
+        coverWithMargin = 15 minutes,
+        coverWithFund = 15 minutes,
         coverWithSurvivorsMargins = 15 minutes,
         coverWithSurvivorsFunds = 15 minutes,
         computeSurvivorsUnfunded = 15 minutes,
@@ -208,6 +192,7 @@ object Main extends App {
         coverWithFirstLevelEquity = 15 minutes,
         coverWithSecondLevelEquity = 15 minutes
       ),
+      market = market,
       scheduler = scheduler
     )
   )
@@ -220,7 +205,7 @@ object Main extends App {
   println(s"member4 as $member4")
 
   val scenario = system.actorOf(
-    Scenario.props(ccps = Set(ccp1, ccp2), timeHorizon = 5 days, scheduler = scheduler)
+    Scenario.props(ccps = Set(ccp1), timeHorizon = 2 days, scheduler = scheduler)
   )
 
   Thread.sleep(2000)

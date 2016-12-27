@@ -6,8 +6,6 @@ import akka.actor.{Actor, Props}
 import akka.pattern.pipe
 import breeze.linalg.{Axis, DenseVector}
 import breeze.stats.distributions.{Gaussian, MultivariateGaussian}
-import cats.data.OptionT
-import cats.implicits._
 import com.github.tototoshi.csv.CSVWriter
 import com.typesafe.scalalogging.Logger
 import market.Market.{Index, Margin, Price}
@@ -19,6 +17,9 @@ import scala.collection._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.concurrent.duration._
+import scalaz.std.list._
+import scalaz.std.option._
+import scalaz.syntax.traverse._
 
 /**
   * Provides the prices for any point in time.
@@ -43,7 +44,7 @@ case class Market(prices: Map[Security, BigDecimal],
   def receive: Receive = {
     case Price(i, t) => sender ! price(i, t)
     case Margin(portfolio, coverage, timeHorizon, t) =>
-      margin(portfolio, coverage, timeHorizon, t).value pipeTo sender
+      margin(portfolio, coverage, timeHorizon, t) pipeTo sender
   }
 
   /**
@@ -52,7 +53,7 @@ case class Market(prices: Map[Security, BigDecimal],
     * @param instrument instrument
     * @return the price for the instrument at the given time.
     */
-  private def price(instrument: Security, time: Time): Option[BigDecimal] = {
+  private def price(instrument: Security, time: Time): BigDecimal = {
 
     /**
       * Helper function for generating prices for a specific point in time.
@@ -61,27 +62,24 @@ case class Market(prices: Map[Security, BigDecimal],
       * @return prices for point in time t.
       */
     def generatePrices(t: Time): Option[Map[Security, BigDecimal]] = {
-      val rs = retDistr.draw().map(BigDecimal(_))
+      val returns = retDistr.draw().map(BigDecimal(_))
 
-      val newPsO = indexes.keys
-        .map(a =>
+      val newPsO = indexes.keys.toList
+        .traverse[Option, (Security, BigDecimal)](security =>
           for {
             // If the data does not exist, recursively generate it.
             ps <- generatedPrices.get(t - tick).orElse(generatePrices(t - tick))
-
-            p <- ps.get(a)
-            i <- indexes.get(a)
-            r = rs(i)
+            p <- ps.get(security)
+            i <- indexes.get(security)
+            r = returns(i)
           } yield {
             // Store the generated past data.
             // Might just overwrite the same if it already existed.
             generatedPrices += (t - tick) -> ps
 
             // Price cannot be negative
-            a -> ((p * (1 + (r / scaling))) max 0)
+            security -> ((p * (1 + (r / scaling))) max 0)
         })
-        .toList
-        .sequence[Option, (Security, BigDecimal)]
         .map(_.toMap)
 
       // Store the new generated data.
@@ -90,18 +88,20 @@ case class Market(prices: Map[Security, BigDecimal],
       for {
         newPs <- newPsO
       } {
+        Future {
           val writer = CSVWriter.open(f, append = true)
           val stringifiedTime = t.toUnit(res).toString
           val stringifiedPs = newPs.values.map(_.toString)
           val row = Iterable(stringifiedTime) ++ stringifiedPs
           writer.writeRow(row.toSeq)
           writer.close()
+        }
       }
 
       newPsO
     }
 
-    generatedPrices.get(time) match {
+    val price = generatedPrices.get(time) match {
       case Some(ps) =>
         ps.get(instrument)
       case None =>
@@ -110,12 +110,14 @@ case class Market(prices: Map[Security, BigDecimal],
           p <- ps.get(instrument)
         } yield p
     }
+
+    price.getOrElse(throw new IllegalStateException())
   }
 
   /**
     * Provides the margin requirements for the portfolio.
     * It is assumed that the return distribution does not change over time.
-    * @param time time at which the margin has to be computed.
+    * @param t time at which the margin has to be computed.
     * @param portfolio portfolio to collateralize.
     * @param coverage coverage needed.
     * @return Amount of margin needed.
@@ -123,7 +125,9 @@ case class Market(prices: Map[Security, BigDecimal],
   private def margin(portfolio: Portfolio,
                      coverage: BigDecimal,
                      timeHorizon: Time,
-                     time: Time): OptionT[Future, BigDecimal] = {
+                     t: Time): Future[BigDecimal] = {
+    logger.debug(s"Computing margin of portfolio $portfolio")
+
     // Set of positions in the portfolio.
     val pPositions = portfolio.positions.keys.toSet
 
@@ -137,23 +141,36 @@ case class Market(prices: Map[Security, BigDecimal],
       throw new IllegalArgumentException("Portfolio is broken.") // Market does not contain all portfolio elements.
     else {
       for {
-        price <- portfolio.price(time)
+        pWeights <- portfolio
+          .weights(t)
+          .map(
+            _.toList
+              .map {
+                case (k, v) => (indexes.get(k).orElse(throw new IllegalStateException()), v)
+              }
+              .sortBy(_._1)
+              .map(_._2))
 
-        pWeights <- OptionT.liftF(portfolio.weights(time).map(_.values))
+        _ = logger.debug(s"pWeights $pWeights")
 
-        weightsVec = DenseVector(pWeights.toList: _*).map(_.doubleValue).asDenseMatrix
+        price <- Portfolio.price(portfolio)(t)
+
+        _ = logger.debug(s"price $price")
+
+        weightsVec = DenseVector(pWeights: _*).map(_.doubleValue)
+
+        _ = logger.debug(s"weightsVec $weightsVec")
 
         // Covariance matrix stripped from the instruments not in the portfolio.
         cov = retDistr.covariance
           .delete(indexesToStrip.toSeq, Axis._0)
           .delete(indexesToStrip.toSeq, Axis._1)
 
-        pVar = (weightsVec.t * cov * weightsVec).map(BigDecimal(_) / scaling)
+        _ = logger.debug(s"cov $cov")
 
-        // pVar should be a matrix of one element.
-        if pVar.rows == 1 && pVar.cols == 1
+        pVar = BigDecimal(weightsVec.t * cov * weightsVec) / scaling
 
-        pSigma = math.sqrt(pVar(0, 0))
+        pSigma = math.sqrt(pVar)
 
         // Volatility over horizon
         pSigmaHorizon = pSigma * math.sqrt(BigDecimal(timeHorizon.toUnit(res)))
@@ -181,8 +198,10 @@ case class Market(prices: Map[Security, BigDecimal],
         valueAtRisk = price * ret
 
         // Only take margin if the value at risk is negative. For instance it could be
-        margin = -valueAtRisk max 0
-      } yield margin // valueAtRisk is negative, we flip the sign.
+        m = -valueAtRisk max 0
+
+        _ = logger.debug(s"m $m")
+      } yield m // valueAtRisk is negative, we flip the sign.
     }
   }
 }
@@ -190,7 +209,7 @@ case class Market(prices: Map[Security, BigDecimal],
 object Market {
   type Index = Int
 
-  case class Price(instrument: Security, t: Time)
+  case class Price(security: Security, t: Time)
   case class Margin(portfolio: Portfolio, coverage: BigDecimal, timeHorizon: Time, t: Time)
 
   def props(prices: Map[Security, BigDecimal],

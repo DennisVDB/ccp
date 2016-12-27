@@ -3,24 +3,26 @@ package structure.ccp
 import java.util.UUID
 
 import akka.actor.{Actor, ActorRef, Props}
-import akka.event.LoggingReceive
-import cats.data.{Kleisli, OptionT}
-import cats.implicits._
+import akka.pattern.pipe
 import com.typesafe.scalalogging.Logger
 import market.Portfolio
-import structure.Scheduler.{TriggerMarginCalls, scheduledMessage}
+import market.Portfolio.{buyAll, sellAll}
+import structure.Scheduler.{ScheduledMessage, TriggerMarginCalls, scheduledMessage}
 import structure.Timed._
 import structure._
 import structure.ccp.Ccp._
 import structure.ccp.Waterfall._
-import util.PaymentSystem
+import util.Result
+import util.Result.Result
 
 import scala.annotation.tailrec
-import scala.collection.breakOut
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.language.postfixOps
 import scala.util.Try
+import scalaz.Kleisli
+import scalaz.std.scalaFuture._
+import scalaz.syntax.applicative._
 
 /**
   * Models a central counterparty (CCP). Performs on demand margin calls and handles the subsequent
@@ -28,27 +30,27 @@ import scala.util.Try
   * @param name name of the CCP
   * @param memberPortfolios portfolios of each member it handles
   * @param ccpPortfolios portfolios of each ccp it handles
-  * @param assets assets owned and their respective liquidity.
+  * @param capital assets owned and their respective liquidity.
   * @param rules rules for configuring the CCP
-  * @tparam A type of the instruments the CCP handles.
   */
-class Ccp[A](
+class Ccp(
     name: String,
     waterfall: Waterfall,
     memberPortfolios: Map[ActorRef, Portfolio],
     ccpPortfolios: => Map[ActorRef, Portfolio],
-    assets: Map[Time, BigDecimal],
+    capital: Portfolio,
     rules: Rules,
     delays: OperationalDelays,
+    market: ActorRef,
     scheduler: ActorRef
-) extends Actor
-    with PaymentSystem {
-  override def receive: Receive = LoggingReceive {
+) extends Actor {
+  override def receive: Receive = {
     case Run(timeHorizon: Time) =>
       scheduleMarginCalls(zero)
 
       /**
         * Recursively schedules margin calls from time t up to the time horizon.
+        *
         * @param t start scheduling at from this time.
         */
       @tailrec
@@ -64,14 +66,9 @@ class Ccp[A](
     case Paid =>
       sender ! totalPaid
 
-    case AddExpectedPayment(m, id, p) => expectedPayments += (m, id) -> p
-    case RemoveExpectedPayment(m, id) => expectedPayments -= ((m, id))
+    case TriggerDefault(member, paymentLeft, t) => triggerDefault(member, paymentLeft, t)
 
-    case UpdateMargin(member, margin) => margins = margins.map(ms => ms.+((member, margin)))
-    case UpdateFund(member, fund) => defaultFunds = defaultFunds.map(fs => fs.+((member, fund)))
-    case UpdateUnfunded(member, unfund) => unfundedFundsLeft += member -> unfund
-    case AddDefaulted(member) => defaultedMembers += member
-    case AddPaymentDue(member, payment) => paymentsDue += member -> payment
+    case NextStage(currentStage, member, loss, t) => nextStage(currentStage)(member, loss, t)
 
     case TimedMessage(t, m) =>
       assert(t >= currentTime,
@@ -84,31 +81,101 @@ class Ccp[A](
 
         /* Calls */
         case MarginCall(id, payment, maxDelay) =>
-          if (payment < 0) updateAssets(-payment)
-          else {
-            val u = handlePayment(_assets, payment, maxDelay - delays.callHandling)
-            update(u.assets, u.timedPayment.payment)
-            scheduleMessage(t + u.timedPayment.delay + delays.callHandling,
-                            sender,
-                            MarginCallResponse(id, self, u.timedPayment.payment))
+          val origSender = sender
 
+          if (payment < 0) {
+            // Always answer.
+            scheduleMessage(t, origSender, MarginCallResponse(id, self, payment))
+
+            val newCapital = for {
+              c <- Result.fromFuture(_capital)
+              (newC, _) <- buyAll(c)(payment, t)
+            } yield newC
+
+            // Reinvestment not fail
+            _capital = newCapital | (throw new IllegalStateException())
+          } else {
+            val newCapitalAndTimeF = for {
+              c <- Result.fromFuture(_capital)
+              (newCap, timeToSell) <- sellAll(c)(payment, t)
+              if timeToSell <= maxDelay
+            } yield (newCap, timeToSell)
+
+            val newCapitalF = newCapitalAndTimeF.map(_._1)
+            val timeToSellF = newCapitalAndTimeF.map(_._2)
+
+            // Fails if not enough was sold or on time, reassign same capital
+            _capital = newCapitalF getOrElseF _capital
+
+            val responseMessage = for {
+              timeToSell <- timeToSellF
+            } yield
+              scheduledMessage(t + timeToSell, origSender, MarginCallResponse(id, self, payment))
+
+            val defaultResponseMessage =
+              scheduledMessage(t, origSender, MarginCallResponse(id, self, 0))
+
+            // Fails if not enough was sold or on time, sends 0.
+            responseMessage | defaultResponseMessage pipeTo scheduler
           }
 
         case DefaultFundCall(id, payment, maxDelay) =>
-          val u = handlePayment(_assets, payment, maxDelay - delays.callHandling)
-          update(u.assets, u.timedPayment.payment)
-          scheduleMessage(t + u.timedPayment.delay + delays.callHandling,
-                          sender,
-                          DefaultFundCallResponse(id, self, u.timedPayment.payment))
+          val origSender = sender
+
+          val newCapitalAndTimeF = for {
+            c <- Result.fromFuture(_capital)
+            (newCap, timeToSell) <- sellAll(c)(payment, t)
+            if timeToSell <= maxDelay
+          } yield (newCap, timeToSell)
+
+          val newCapitalF = newCapitalAndTimeF.map(_._1)
+          val timeToSellF = newCapitalAndTimeF.map(_._2)
+
+          // Fails if not enough was sold or on time, reassign same capital
+          _capital = newCapitalF getOrElseF _capital
+
+          val responseMessage = for {
+            timeToSell <- timeToSellF
+          } yield
+            scheduledMessage(t + timeToSell,
+                             origSender,
+                             DefaultFundCallResponse(id, self, payment))
+
+          val defaultResponseMessage =
+            scheduledMessage(t, origSender, DefaultFundCallResponse(id, self, 0))
+
+          // Fails if not enough was sold or on time, sends 0.
+          responseMessage | defaultResponseMessage pipeTo scheduler
 
         case UnfundedDefaultFundCall(id, waterfallId, payment, maxDelay) =>
-          val u = handlePayment(_assets, payment, maxDelay - delays.callHandling)
-          update(u.assets, u.timedPayment.payment)
-          scheduleMessage(
-            t + u.timedPayment.delay + delays.callHandling,
-            sender,
-            UnfundedDefaultFundCallResponse(waterfallId, id, self, u.timedPayment.payment))
+          val origSender = sender
 
+          val newCapitalAndTimeF = for {
+            c <- Result.fromFuture(_capital)
+            (newCap, timeToSell) <- sellAll(c)(payment, t)
+            if timeToSell <= maxDelay
+          } yield (newCap, timeToSell)
+
+          val newCapitalF = newCapitalAndTimeF.map(_._1)
+          val timeToSellF = newCapitalAndTimeF.map(_._2)
+
+          // Fails if not enough was sold or on time, reassign same capital
+          _capital = newCapitalF getOrElseF _capital
+
+          val responseMessage = for {
+            timeToSell <- timeToSellF
+          } yield
+            scheduledMessage(t + timeToSell,
+                             origSender,
+                             UnfundedDefaultFundCallResponse(id, waterfallId, self, payment))
+
+          val defaultResponseMessage =
+            scheduledMessage(t,
+                             origSender,
+                             UnfundedDefaultFundCallResponse(id, waterfallId, self, 0))
+
+          // Fails if not enough was sold or on time, sends 0.
+          responseMessage | defaultResponseMessage pipeTo scheduler /**/
         /* Responses */
         case MarginCallResponse(id, responder, payment) =>
           handleMarginCallResponse(responder, id, payment, t)
@@ -147,12 +214,10 @@ class Ccp[A](
 
   private val logger = Logger(name)
 
-  private var currentWaterfallStage: WaterfallStage = Start
-
   private var currentTime = zero
   private var previousCallTime = zero
 
-  private var _assets = assets
+  private var _capital = Future.successful(capital)
   private var totalPaid: BigDecimal = 0
 
   private val members: Set[ActorRef] = memberPortfolios.keys.toSet
@@ -163,29 +228,21 @@ class Ccp[A](
 
   private var defaultedMembers: Set[ActorRef] = Set.empty
 
-  private var paymentsDue: Map[ActorRef, BigDecimal] = Map.empty
+  private var paymentsDue: Map[ActorRef, Result[BigDecimal]] = Map.empty
   private val vmgh = waterfall.stages.contains(VMGH)
   private var haircutsInProgress = 0
   private val holdPayments = vmgh && haircutsInProgress > 0
 
   /**
     * The prices of the portfolios at time t.
+    *
     * @param t point in time of the prices.
     * @return the portfolio prices of each member.
     */
-  private def portfolioPrices(t: Time): Future[Map[ActorRef, BigDecimal]] = {
-    val prices = for {
-      (member, portfolio) <- allPortfolios
-    } yield (member, portfolio.price(t))
-
-    val pricesO = Future.traverse(prices) { case (m, fo) => fo.value.map(m -> _) }
-
-    // Filter out all the "None" portfolio prices.
-    // So as to not have options as values.
-    pricesO.map(p =>
-      Map(p.toSeq: _*).collect {
-        case (k, Some(v)) => (k, v)
-    })
+  private def portfolioPrice(member: ActorRef, t: Time): Result[BigDecimal] = {
+    Result.fromOptFut(for {
+      p <- allPortfolios.get(member)
+    } yield Portfolio.price(p)(t))
   }
 
   /**
@@ -196,27 +253,44 @@ class Ccp[A](
       if (rules.ccpRules.participatesInMargin) {
         for {
           (member, portfolio) <- allPortfolios
-        } yield member -> portfolio.margin(zero)(rules.marginCoverage, rules.timeHorizon)
+        } yield {
+          val f = portfolio.margin(zero)(rules.marginCoverage, rules.timeHorizon)
+
+          member -> f
+        }
       } else {
         for {
           (member, portfolio) <- memberPortfolios
-        } yield member -> portfolio.margin(zero)(rules.marginCoverage, rules.timeHorizon)
+        } yield {
+          val f = portfolio.margin(zero)(rules.marginCoverage, rules.timeHorizon)
+
+          member -> f
+        }
       }
 
-    val marginsO = Future.traverse(margins) { case (m, fo) => fo.value.map(m -> _) }
+    val f = Future.traverse(margins) { case (m, f) => f.map(m -> _) }.map(_.toMap)
 
-    // Filter out all the "None" margins.
-    // So as to not have options as values
-    marginsO.map(m =>
-      Map(m.toSeq: _*).collect {
-        case (k, Some(v)) => (k, v)
-    })
+    f
   }
 
   /**
     * Posted margins of members.
     */
-  private var margins: Future[Map[ActorRef, BigDecimal]] = initialMargins
+  private var margins: Map[ActorRef, Future[BigDecimal]] = {
+    if (rules.ccpRules.participatesInMargin) {
+      for {
+        (member, portfolio) <- allPortfolios
+      } yield {
+        member -> portfolio.margin(zero)(rules.marginCoverage, rules.timeHorizon)
+      }
+    } else {
+      for {
+        (member, portfolio) <- memberPortfolios
+      } yield {
+        member -> portfolio.margin(zero)(rules.marginCoverage, rules.timeHorizon)
+      }
+    }
+  }
 
   /**
     * Snapshot of the default funds when setting up the CCP.
@@ -224,7 +298,7 @@ class Ccp[A](
   private val initDefaultFunds: Future[Map[ActorRef, BigDecimal]] = {
     def fundContribution(m: ActorRef) = {
       val funds = for {
-        im <- OptionT(initialMargins.map(_.get(m)))
+        im <- Result(initialMargins.map(_.get(m)))
         f = im * rules.fundParticipation
       } yield f
 
@@ -233,7 +307,7 @@ class Ccp[A](
 
     val funds = allMembers.map(fundContribution).toMap
 
-    val fundsO = Future.traverse(funds) { case (m, fo) => fo.value.map(m -> _) }
+    val fundsO = Future.traverse(funds) { case (m, fo) => fo.run.map(m -> _) }
 
     fundsO.map(f =>
       Map(f.toSeq: _*).collect {
@@ -241,18 +315,27 @@ class Ccp[A](
     })
   }
 
-//  logger.debug(s"Initial margins: $initialMargins")
-
   /**
     * Posted default funds of members.
     */
-  private var defaultFunds: Future[Map[ActorRef, BigDecimal]] = initDefaultFunds
+  private var defaultFunds: Map[ActorRef, Future[BigDecimal]] = {
+    def fundContribution(m: ActorRef) = {
+      val funds = for {
+        im <- initialMargins.map(_.getOrElse(m, throw new IllegalStateException()))
+        f = im * rules.fundParticipation
+      } yield f
+
+      m -> funds
+    }
+
+    allMembers.map(fundContribution).toMap
+  }
 
   /**
     * How much unfunded funds can still be called upon.
     */
-  private var unfundedFundsLeft: Map[ActorRef, BigDecimal] =
-    allMembers.map(m => m -> rules.maximumFundCall)(breakOut)
+  private var unfundedFundsLeft: Map[ActorRef, Result[BigDecimal]] =
+    allMembers.map(_ -> Result.pure(rules.maximumFundCall)).toMap
 
   /**
     * Computes the percentage of the initial default funds of the member ex defaulted members.
@@ -260,16 +343,16 @@ class Ccp[A](
     * @param member member for which to compute the pro-rata
     * @return percentage of the default funds of the member ex defaulted members.
     */
-  private def proRataDefaultFunds(member: ActorRef): OptionT[Future, BigDecimal] = {
+  private def proRataDefaultFunds(member: ActorRef): Result[BigDecimal] = {
     val survivingMembersFunds =
       initDefaultFunds.map(_.withFilter(e => !defaultedMembers.contains(e._1)))
 
     val totalFundsF = survivingMembersFunds.map(_.map(_._2).sum)
 
     for {
-      part <- OptionT(initDefaultFunds.map(_.get(member)))
-      totalFunds <- OptionT.liftF(totalFundsF)
-      proRata <- OptionT.fromOption[Future](Try(part / totalFunds).toOption)
+      part <- Result(initDefaultFunds.map(_.get(member)))
+      totalFunds <- Result.fromFuture(totalFundsF)
+      proRata <- Result.fromOption(Try(part / totalFunds).toOption)
     } yield proRata
   }
 
@@ -281,28 +364,28 @@ class Ccp[A](
     */
   private def proRataInitialMargins(
       member: ActorRef
-  ): OptionT[Future, BigDecimal] = {
+  ): Result[BigDecimal] = {
     val survivingMembersMargins =
       initialMargins.map(_.withFilter(e => !defaultedMembers.contains(e._1)))
 
     val totalMarginsF = survivingMembersMargins.map(_.map(_._2).sum)
 
     for {
-      part <- OptionT(initialMargins.map(_.get(member)))
-      totalMargins <- OptionT.liftF(totalMarginsF)
-      proRata <- OptionT.fromOption[Future](Try(part / totalMargins).toOption)
+      part <- Result(initialMargins.map(_.get(member)))
+      totalMargins <- Result.fromFuture(totalMarginsF)
+      proRata <- Result.fromOption(Try(part / totalMargins).toOption)
     } yield proRata
   }
 
   /**
     * Expected payments after calls.
     */
-  private var expectedPayments: Map[(ActorRef, RequestId), BigDecimal] = Map.empty
+  private var expectedPayments: Map[(ActorRef, RequestId), Result[BigDecimal]] = Map.empty
 
-//  /**
-//    * Expected default fund payment after fund call.
-//    */
-//  private var expectedDefaultFundPayments: Map[(ActorRef, RequestId), BigDecimal] = Map.empty
+  //  /**
+  //    * Expected default fund payment after fund call.
+  //    */
+  //  private var expectedDefaultFundPayments: Map[(ActorRef, RequestId), BigDecimal] = Map.empty
 
   private case class UnfundedBuffer(collected: BigDecimal,
                                     waitingFor: Int,
@@ -313,10 +396,11 @@ class Ccp[A](
 
   /**
     * Triggers margin calls at time t.
+    *
     * @param t time of margin call.
     */
   private def triggerMarginCalls(t: Time): Unit = {
-//    implicit val timeout: Timeout = Timeout(60 seconds)
+    //    implicit val timeout: Timeout = Timeout(60 seconds)
 
     val survivors = allMembers -- defaultedMembers
     survivors.foreach(memberMarginCall(_, t))
@@ -326,43 +410,50 @@ class Ccp[A](
 
   /**
     * Margin call to member m at time t.
+    *
     * @param member member to call.
-    * @param t time of call.
+    * @param t      time of call.
     */
-  private def memberMarginCall(member: ActorRef, t: Time): Unit =
-    for {
-      oldPrice <- OptionT(portfolioPrices(previousCallTime).map(_.get(member)))
-      currentPrice <- OptionT(portfolioPrices(t).map(_.get(member)))
+  private def memberMarginCall(member: ActorRef, t: Time): Future[ScheduledMessage] = {
+    val previousMarginF = Result.fromOptFut(margins.get(member))
+    val oldPriceF = portfolioPrice(member, previousCallTime)
+    val currentPriceF = portfolioPrice(member, t)
 
-      variationMargin = oldPrice - currentPrice
+    val currentMarginF =
+      (previousMarginF |@| oldPriceF |@| currentPriceF)((p, o, c) => p - (o - c))
 
-      previousMargin <- OptionT(margins.map(_.get(member)))
+    margins += member -> (currentMarginF | (throw new IllegalStateException()))
 
-      _ = logger.debug(s"Margin: $previousMargin")
+    val marginCallF = for {
+      initialMargin <- Result(initialMargins.map(_.get(member)))
+      currentMargin <- currentMarginF
 
-      currentMargin = previousMargin - variationMargin
-
-      // Update margin
-      _ = self ! UpdateMargin(member, currentMargin)
-
-      initialMargin <- OptionT(initialMargins.map(_.get(member)))
-
-      marginCall = initialMargin - currentMargin // (initialMargin - currentMargin) + variationMargin
+      marginCall = initialMargin - currentMargin
 
       // Also send negative margin calls (send money to the member).
       if marginCall.abs >= rules.minimumTransfer
+    } yield marginCall
 
-      id = generateUuid
+    val paymentDue = for {
+      marginCall <- marginCallF
+      if marginCall < 0 && holdPayments
 
-      _ = if (holdPayments && marginCall < 0) {
-        for {
-          currentDue <- paymentsDue.get(member)
-        } yield self ! AddPaymentDue(member, currentDue + marginCall)
-      } else {
-        self ! AddExpectedPayment(member, id, marginCall)
-        scheduleMessage(t, member, MarginCall(id, marginCall, rules.maxCallPeriod))
-      }
-    } yield ()
+      currentDue <- Result.fromOptRes(paymentsDue.get(member))
+    } yield currentDue + marginCall
+
+    paymentsDue += member -> paymentDue
+
+    val id = generateUuid
+
+    val outboundMarginCallF = marginCallF.filter(_ >= 0 || !holdPayments)
+
+    expectedPayments += (member, id) -> outboundMarginCallF
+
+    val outboundMarginCallMessageF = outboundMarginCallF.map(mc =>
+      scheduledMessage(t, member, MarginCall(id, mc, rules.maxCallPeriod)))
+
+    Result.collect(outboundMarginCallMessageF) pipeTo scheduler
+  }
 
   /**
     * Handles what happens after a margin call response.
@@ -376,19 +467,15 @@ class Ccp[A](
       id: RequestId,
       payment: BigDecimal,
       t: Time
-  ): Unit =
-    for {
-      // Update margin with payment
-      currentMargin <- OptionT(margins.map(_.get(member)))
-      _ = self ! UpdateMargin(member, currentMargin + payment)
+  ): Unit = {
+    val newMargin = for {
+      currentMargin <- Result.fromOptFut(margins.get(member))
+    } yield currentMargin + payment
 
-      expectedPayment <- OptionT.fromOption[Future](expectedPayments.get((member, id)))
-      _ = RemoveExpectedPayment(member, id)
+    margins += member -> (newMargin | (throw new IllegalStateException()))
 
-      // Defaulted on payment
-      if payment < expectedPayment
-      paymentLeft = expectedPayment - payment
-    } yield triggerDefault(member, paymentLeft, t)
+    checkAndTrigger(member, id, payment, t)
+  }
 
   /**
     * Handles what happens after a default fund call response.
@@ -402,19 +489,28 @@ class Ccp[A](
       id: RequestId,
       payment: BigDecimal,
       t: Time
-  ): Unit =
-    for {
-      // Update fund with payment
-      currentDefaultFund <- OptionT(defaultFunds.map(_.get(member)))
-      _ = self ! UpdateFund(member, currentDefaultFund + payment)
+  ): Unit = {
+    val updateFund = for {
+      currentFund <- Result.fromOptFut(defaultFunds.get(member))
+    } yield currentFund + payment
 
-      expectedPayment <- OptionT.fromOption[Future](expectedPayments.get((member, id)))
-      _ = self ! RemoveExpectedPayment(member, id)
+    defaultFunds += member -> (updateFund | (throw new IllegalStateException()))
+
+    checkAndTrigger(member, id, payment, t)
+  }
+
+  private def checkAndTrigger(member: ActorRef, id: RequestId, payment: BigDecimal, t: Time) = {
+    val paymentLeftMessageF = for {
+      expectedPayment <- Result.fromOptRes(expectedPayments.get((member, id)))
 
       // Defaulted on payment
       if payment < expectedPayment
-      paymentLeft = expectedPayment - payment
-    } yield triggerDefault(member, paymentLeft, t)
+    } yield TriggerDefault(member, expectedPayment - payment, t)
+
+    expectedPayments -= ((member, id))
+
+    Result.collect(paymentLeftMessageF) pipeTo self
+  }
 
   /**
     * Handles what happens after an unfunded default fund call response.
@@ -430,15 +526,16 @@ class Ccp[A](
       waterfallId: RequestId,
       payment: BigDecimal,
       t: Time
-  ): Unit =
+  ): Unit = {
+    val triggerDefaultMessageF = for {
+      expectedPayment <- Result.fromOptRes(expectedPayments.get((member, id)))
+      if payment < expectedPayment
+    } yield TriggerDefault(member, expectedPayment - payment, t)
+
+    Result.collect(triggerDefaultMessageF) pipeTo self
+
     for {
-      expectedPayment <- expectedPayments.get((member, id))
-      _ = self ! RemoveExpectedPayment(member, id)
-
       b <- expectedUnfundedFunds.get(waterfallId)
-      _ = expectedUnfundedFunds -= waterfallId
-
-      _ = if (payment < expectedPayment) triggerDefault(member, expectedPayment - payment, t)
 
       _ = if (b.waitingFor == 1) {
         // Finished waiting
@@ -453,6 +550,10 @@ class Ccp[A](
       }
     } yield ()
 
+    expectedPayments -= ((member, id))
+    expectedUnfundedFunds -= waterfallId
+  }
+
   /**
     * Starts the waterfall process for the member.
     * @param member member the defaulted.
@@ -463,27 +564,27 @@ class Ccp[A](
       member: ActorRef,
       loss: BigDecimal,
       t: Time
-  ): Unit = {
-    logger.debug("Started")
+  ): Future[NextStage] = {
 
     // Margin payments are not paid during waterfalls if VMGH is used.
     haircutsInProgress += 1
 
     if (defaultedMembers.contains(member)) {
-      nextStage(Start)(member, loss, t)
+      throw new IllegalStateException()
     } else {
-      self ! AddDefaulted(member)
+      defaultedMembers += member
 
-      for {
-        portfolio <- OptionT.fromOption[Future](allPortfolios.get(member))
-        replacementCost <- portfolio.replacementCost(t + portfolio.liquidity)
+      val cover = for {
+        portfolio <- Result.fromOption(allPortfolios.get(member))
+        (replacementCost, timeToReplace) <- Result.fromFuture(portfolio.replacementCost(t))
+      } yield
+        (NextStage(Start, member, loss, t),
+         NextStage(Start, member, replacementCost, t + timeToReplace))
 
-        // Waterfall for loss due incomplete call payment.
-        _ = nextStage(Start)(member, loss, t)
+      val coverMessages = Result.collect(cover)
 
-        // Waterfall for loss due to replacement cost.
-        _ = nextStage(Start)(member, replacementCost, t + portfolio.liquidity)
-      } yield ()
+      coverMessages.map(_._1) pipeTo self
+      coverMessages.map(_._2) pipeTo self
     }
   }
 
@@ -493,7 +594,6 @@ class Ccp[A](
     * @param time time
     */
   private def handleWaterfallResult(member: ActorRef, loss: BigDecimal, time: Time): Unit = {
-    logger.debug("Ended")
     logger.debug(s"Loss $loss for member $member")
   }
 
@@ -505,7 +605,7 @@ class Ccp[A](
     */
   private def coverWithDefaultedCollateral(defaultedMember: ActorRef,
                                            loss: BigDecimal,
-                                           t: Time): Unit = {
+                                           t: Time): Future[NextStage] = {
 
     /**
       * Covers the losses with the defaulting member' posted initial margin.
@@ -513,20 +613,22 @@ class Ccp[A](
       * @return covered losses
       */
     def coverWithInitialMargin(defaultedMember: ActorRef) =
-      Kleisli[OptionT[Future, ?], BigDecimal, BigDecimal](loss => {
+      Kleisli[Result, BigDecimal, BigDecimal](loss => {
         if (loss <= 0) {
-          OptionT.fromOption[Future](Some(0))
+          Result.pure(0)
         } else {
+          val currentMarginF = Result.fromOptFut(margins.get(defaultedMember))
+
           // Left after using margin
           val lossAfterMarginUse = for {
-            currentMargin <- OptionT(margins.map(_.get(defaultedMember)))
+            currentMargin <- currentMarginF
+          } yield loss - (currentMargin max 0)
 
-            // Cannot use negative margin
-            lossLeft = loss - (currentMargin max 0)
+          val newMargin = for {
+            currentMargin <- currentMarginF
+          } yield currentMargin - (loss min currentMargin)
 
-            // Update margins, cannot use more than the current margin
-            _ = self ! UpdateMargin(defaultedMember, currentMargin - (loss min currentMargin))
-          } yield lossLeft
+          margins += defaultedMember -> (newMargin | (throw new IllegalStateException()))
 
           lossAfterMarginUse.map(_ max 0)
         }
@@ -538,19 +640,22 @@ class Ccp[A](
       * @return covered losses
       */
     def coverWithFund(defaultedMember: ActorRef) =
-      Kleisli[OptionT[Future, ?], BigDecimal, BigDecimal](loss => {
+      Kleisli[Result, BigDecimal, BigDecimal](loss => {
         if (loss <= 0) {
-          OptionT.fromOption[Future](Some(0))
+          Result.pure(0)
         } else {
+          val currentFundF = Result.fromOptFut(defaultFunds.get(defaultedMember))
+
           // Left after funds use
           val lossAfterFundUse = for {
-            currentFund <- OptionT(defaultFunds.map(_.get(defaultedMember)))
+            currentFund <- currentFundF
+          } yield loss - (currentFund max 0)
 
-            // Cannot use negative fund
-            lossLeft = loss - (currentFund max 0)
+          val newFund = for {
+            currentFund <- currentFundF
+          } yield currentFund - (loss min currentFund)
 
-            _ = self ! UpdateFund(defaultedMember, currentFund - (loss min currentFund))
-          } yield lossLeft
+          defaultFunds += defaultedMember -> (newFund | (throw new IllegalStateException()))
 
           lossAfterFundUse.map(_ max 0)
         }
@@ -559,11 +664,13 @@ class Ccp[A](
     val coverWithCollateral = coverWithInitialMargin(defaultedMember) andThen coverWithFund(
         defaultedMember)
 
-    val delayedT = t + (delays.coverWithDefaultedMargin max delays.coverWithDefaultedFund)
+    val delayedT = t + (delays.coverWithMargin max delays.coverWithFund)
 
-    for {
+    val nextStageMessage = for {
       l <- coverWithCollateral(loss)
-    } yield nextStage(Defaulted)(defaultedMember, l, delayedT)
+    } yield NextStage(Defaulted, defaultedMember, l, delayedT)
+
+    Result.collect(nextStageMessage) pipeTo self
   }
 
   /**
@@ -574,7 +681,7 @@ class Ccp[A](
     */
   private def coverWithNonDefaultedCollateral(defaultedMember: ActorRef,
                                               loss: BigDecimal,
-                                              t: Time): Unit = {
+                                              t: Time): Future[NextStage] = {
 
     /**
       * Covers the losses with the surviving members margin.
@@ -584,34 +691,44 @@ class Ccp[A](
     def coverWithSurvivingMargin(defaultedMember: ActorRef) =
       Kleisli[Future, BigDecimal, BigDecimal](loss => {
         if (loss <= 0) {
-          Future.successful(BigDecimal(0))
+          BigDecimal(0).point[Future]
         } else {
           val survivingMemberMargins =
-            margins.map(_.withFilter(entry => !defaultedMembers.contains(entry._1)))
+            margins.withFilter(entry => !defaultedMembers.contains(entry._1))
 
-          val totalMarginsF = survivingMemberMargins.map(_.map(_._2).sum)
+          val totalMarginsF =
+            survivingMemberMargins
+              .map(_._2)
+              .foldLeft(BigDecimal(0).point[Future])((a, b) => (a |@| b)(_ + _))
 
           val survivingMembers = allMembers -- defaultedMembers
 
           survivingMembers.foreach(
             member => {
-              for {
-                currentMargin <- OptionT(margins.map(_.get(member)))
+              val currentMarginF = Result.fromOptFut(margins.get(member))
+
+              val paymentF = for {
                 proRata <- proRataInitialMargins(member)
-                totalMargins <- OptionT.liftF(totalMarginsF)
+                totalMargins <- Result.fromFuture(totalMarginsF)
                 payment = (loss min totalMargins) * proRata
-
-                // Needs to pay
                 if payment > 0
+              } yield payment
 
-                _ = self ! UpdateMargin(member, currentMargin - payment)
+              val newMarginF = (currentMarginF |@| paymentF)(_ - _)
 
-                id = generateUuid
-                _ = self ! AddExpectedPayment(member, id, payment)
+              margins += defaultedMember -> (newMarginF ||| currentMarginF | (throw new IllegalStateException()))
+
+              val id = generateUuid
+
+              val marginCallMessageF = for {
+                payment <- paymentF
               } yield
-                scheduleMessage(t + delays.coverWithSurvivorsFunds,
-                                member,
-                                MarginCall(id, payment, rules.maxCallPeriod))
+                scheduledMessage(t + delays.coverWithSurvivorsMargins,
+                                 member,
+                                 MarginCall(id, payment, rules.maxCallPeriod))
+
+              expectedPayments += (member, id) -> paymentF
+              Result.collect(marginCallMessageF) pipeTo scheduler
             }
           )
 
@@ -627,33 +744,43 @@ class Ccp[A](
     def coverWithNonDefaultingFunds(defaultedMember: ActorRef) =
       Kleisli[Future, BigDecimal, BigDecimal](loss => {
         if (loss <= 0) {
-          Future.successful(BigDecimal(0))
+          BigDecimal(0).point[Future]
         } else {
           val survivingMemberFunds =
-            defaultFunds.map(_.withFilter(entry => !defaultedMembers.contains(entry._1)))
-          val totalFundsF = survivingMemberFunds.map(_.map(_._2).sum)
+            defaultFunds.withFilter(entry => !defaultedMembers.contains(entry._1))
+
+          val totalFundsF = survivingMemberFunds
+            .map(_._2)
+            .foldLeft(BigDecimal(0).point[Future])((a, b) => (a |@| b)(_ + _))
 
           val survivingMembers = allMembers -- defaultedMembers
 
           survivingMembers.foreach(
             member => {
-              for {
-                currentFund <- OptionT(defaultFunds.map(_.get(member)))
+              val currentFundF = Result.fromOptFut(defaultFunds.get(member))
+
+              val paymentF = for {
                 proRata <- proRataDefaultFunds(member)
-                totalFunds <- OptionT.liftF(totalFundsF)
+                totalFunds <- Result.fromFuture(totalFundsF)
                 payment = (loss min totalFunds) * proRata
-
-                // Needs to pay
                 if payment > 0
+              } yield payment
 
-                _ = self ! UpdateFund(member, currentFund - payment)
+              val newFundF = (currentFundF |@| paymentF)(_ - _)
 
-                id = generateUuid
-                _ = self ! AddExpectedPayment(member, id, payment)
+              defaultFunds += defaultedMember -> (newFundF ||| currentFundF | (throw new IllegalStateException()))
+
+              val id = generateUuid
+
+              val fundCallMessageF = for {
+                payment <- paymentF
               } yield
-                scheduleMessage(t + delays.coverWithSurvivorsFunds,
-                                member,
-                                DefaultFundCall(id, payment, rules.maxCallPeriod))
+                scheduledMessage(t + delays.coverWithSurvivorsFunds,
+                                 member,
+                                 DefaultFundCall(id, payment, rules.maxRecapPeriod))
+
+              expectedPayments += (member, id) -> paymentF
+              Result.collect(fundCallMessageF) pipeTo scheduler
             }
           )
 
@@ -664,11 +791,17 @@ class Ccp[A](
     val coverWithSurvivors = coverWithNonDefaultingFunds(defaultedMember) andThen
         coverWithSurvivingMargin(defaultedMember)
 
-    val delayedT = t + (delays.coverWithSurvivorsMargins max delays.coverWithSurvivorsFunds)
+    val delay =
+      if (rules.marginIsRingFenced) delays.coverWithSurvivorsFunds
+      else delays.coverWithMargin max delays.coverWithFund
 
-    for {
+    val delayedT = t + delay
+
+    val nextStageMessageF = for {
       l <- coverWithSurvivors(loss)
-    } yield nextStage(Survivors)(defaultedMember, l, delayedT)
+    } yield NextStage(Survivors, defaultedMember, l, delayedT)
+
+    nextStageMessageF pipeTo self
   }
 
   /**
@@ -679,33 +812,41 @@ class Ccp[A](
     */
   private def collectUnfunded(defaultedMember: ActorRef, loss: BigDecimal, t: Time): Unit = {
     //      implicit val timeout: Timeout = Timeout(60 seconds)
-    val survivingMember = allMembers -- defaultedMembers
+    val survivingMembers = allMembers -- defaultedMembers
     val waterfallId = generateUuid
 
-    val payments = survivingMember.map(member => {
-      for {
-        fundLeft <- OptionT.fromOption[Future](unfundedFundsLeft.get(member))
+    survivingMembers.map { member =>
+      val unfundedLeftF = Result.fromOptRes(unfundedFundsLeft.get(member))
+
+      val paymentF = for {
+        unfundedLeft <- unfundedLeftF
         proRata <- proRataDefaultFunds(member)
 
         // Don't call more than allowed
-        payment = (loss * proRata) min fundLeft
-
-        // Has to pay
+        payment = (loss * proRata) min unfundedLeft
         if payment > 0
-
-        id = generateUuid
-        _ = self ! AddExpectedPayment(member, id, payment)
-
-        _ = scheduleMessage(
-          t + delays.computeSurvivorsUnfunded,
-          member,
-          UnfundedDefaultFundCall(id, waterfallId, payment, rules.maxRecapPeriod))
-
-        _ = self ! UpdateUnfunded(member, fundLeft - payment)
       } yield payment
-    })
 
-    expectedUnfundedFunds += waterfallId -> UnfundedBuffer(0, payments.size, defaultedMember, loss)
+      val newFundLeftF = (unfundedLeftF |@| paymentF)(_ - _)
+      unfundedFundsLeft += member -> (newFundLeftF ||| unfundedLeftF)
+
+      val id = generateUuid
+
+      val unfundedFundCallMessageF = for {
+        payment <- paymentF
+      } yield
+        scheduledMessage(t + delays.computeSurvivorsUnfunded,
+                         member,
+                         UnfundedDefaultFundCall(id, waterfallId, payment, rules.maxCallPeriod))
+
+      expectedPayments += (member, id) -> paymentF
+      Result.collect(unfundedFundCallMessageF) pipeTo scheduler
+    }
+
+    expectedUnfundedFunds += waterfallId -> UnfundedBuffer(0,
+                                                           survivingMembers.size,
+                                                           defaultedMember,
+                                                           loss)
   }
 
   /**
@@ -727,22 +868,32 @@ class Ccp[A](
   }
 
   private def coverWithVMGH(defaultedMember: ActorRef, loss: BigDecimal, t: Time): Unit = {
-    val totalDue = paymentsDue.values.sum
+    val totalDue = paymentsDue.values.fold(Result.pure(BigDecimal(0)))((a, b) => (a |@| b)(_ + _))
 
-    val haircuts = paymentsDue.map({
-      case (m, due) => (m, loss * (due / totalDue))
-    })
+    val available = for {
+      tot <- totalDue
+    } yield loss min tot
 
-    val collected = (for {
+    val haircuts = paymentsDue.map {
+      case (m, due) =>
+        (m, (due |@| totalDue |@| available)((d, tot, av) => av * (d / tot)))
+    }
+
+    val newDue = for {
       (m, due) <- paymentsDue
       haircut <- haircuts.get(m)
 
       // Cannot cut more than is due
-      afterHaircut = (due - haircut) max 0
-      _ = paymentsDue += m -> afterHaircut
-    } yield afterHaircut).sum
+      afterHaircut = (due |@| haircut)(_ - _)
+    } yield m -> afterHaircut
 
-    nextStage(VMGH)(defaultedMember, loss - collected, t + delays.coverWithVMGH)
+    paymentsDue = newDue
+
+    val nextStageMessageF = for {
+      av <- available
+    } yield NextStage(VMGH, defaultedMember, loss - av, t + delays.coverWithVMGH)
+
+    Result.collect(nextStageMessageF) pipeTo self
   }
 
   /**
@@ -754,10 +905,14 @@ class Ccp[A](
 
     // Can release the payments due
     if (haircutsInProgress == 0) {
-      paymentsDue.foreach({
+      val paymentDueMessagesF = paymentsDue.map {
         case (m, due) =>
-          scheduleMessage(t, m, MarginCall(generateUuid, due, rules.maxCallPeriod))
-      })
+          for {
+            d <- due
+          } yield scheduledMessage(t, m, MarginCall(generateUuid, d, rules.maxCallPeriod))
+      }
+
+      paymentDueMessagesF.map(Result.collect).map(_ pipeTo scheduler)
     }
   }
 
@@ -769,19 +924,31 @@ class Ccp[A](
     */
   private def coverWithFirstLevelEquity(defaultedMember: ActorRef,
                                         loss: BigDecimal,
-                                        t: Time): Unit = {
-    val totalEquity = _assets.values.sum
-    val equityForFirstLevel = totalEquity * rules.skinInTheGame
+                                        t: Time): Future[NextStage] = {
+    val totalEquityF = _capital.flatMap(Portfolio.price(_)(t))
 
-    // Don't use more than the equity for the first level.
-    val u =
-      handlePayment(_assets, loss min equityForFirstLevel, delays.coverWithFirstLevelEquity)
+    val equityForFirstLevelF = totalEquityF.map(_ * rules.skinInTheGame)
 
-    update(u.assets, u.timedPayment.payment)
+    val toSellF = equityForFirstLevelF.map(_ min loss)
 
-    nextStage(FirstLevelEquity)(defaultedMember,
-                                loss - u.timedPayment.payment,
-                                t + u.timedPayment.delay)
+    val newCapAndTime = for {
+      c <- Result.fromFuture(_capital)
+      toSell <- Result.fromFuture(toSellF)
+      r <- sellAll(c)(toSell, t)
+    } yield r
+
+    val newCapitalF = newCapAndTime.map(_._1)
+    val timeToSellF = newCapAndTime.map(_._2)
+
+    // Fails if selling failed
+    _capital = newCapitalF | (throw new IllegalStateException())
+
+    val nextStageMessage = for {
+      timeToSell <- timeToSellF
+      toSell <- Result.fromFuture(toSellF)
+    } yield NextStage(FirstLevelEquity, defaultedMember, loss - toSell, t + timeToSell)
+
+    Result.collect(nextStageMessage) pipeTo self
   }
 
   /**
@@ -792,14 +959,29 @@ class Ccp[A](
     */
   private def coverWithSecondLevelEquity(defaultedMember: ActorRef,
                                          loss: BigDecimal,
-                                         t: Time): Unit = {
-    val u = handlePayment(_assets, loss, delays.coverWithSecondLevelEquity)
+                                         t: Time): Future[NextStage] = {
+    val totalEquityF = _capital.flatMap(Portfolio.price(_)(t))
 
-    update(u.assets, u.timedPayment.payment)
+    val toSellF = totalEquityF.map(_ min loss)
 
-    nextStage(SecondLevelEquity)(defaultedMember,
-                                 loss - u.timedPayment.payment,
-                                 t + u.timedPayment.delay)
+    val newCapAndTime = for {
+      c <- Result.fromFuture(_capital)
+      toSell <- Result.fromFuture(toSellF)
+      r <- sellAll(c)(toSell, t)
+    } yield r
+
+    val newCapitalF = newCapAndTime.map(_._1)
+    val timeToSellF = newCapAndTime.map(_._2)
+
+    // Fails if selling failed
+    _capital = newCapitalF | (throw new IllegalStateException())
+
+    val nextStageMessage = for {
+      timeToSell <- timeToSellF
+      toSell <- Result.fromFuture(toSellF)
+    } yield NextStage(SecondLevelEquity, defaultedMember, loss - toSell, t + timeToSell)
+
+    Result.collect(nextStageMessage) pipeTo self
   }
 
   /**
@@ -808,27 +990,15 @@ class Ccp[A](
     */
   private def generateUuid = new RequestId(UUID.randomUUID().toString)
 
-  /**
-    * Updates the member with its new assets and what has been paid for the call.
-    * @param assets new assets.
-    * @param payment additional payment.
-    */
-  private def update(assets: Map[Time, BigDecimal], payment: BigDecimal): Unit = {
-    _assets = assets
-    totalPaid += payment
-  }
-
-  /**
-    * Updates the assets with the payment. Liquidity is assumed to be 0.
-    * @param payment payment to add.
-    */
-  private def updateAssets(payment: BigDecimal): Unit = {
-    for {
-      currentAmount <- _assets.get(zero)
-
-      _ = _assets += zero -> (currentAmount + payment)
-    } yield ()
-  }
+//  /**
+//    * Updates the member with its new assets and what has been paid for the call.
+//    * @param assets new assets.
+//    * @param payment additional payment.
+//    */
+//  private def update(assets: Map[Time, BigDecimal], payment: BigDecimal): Unit = {
+//    _capital = assets
+//    totalPaid += payment
+//  }
 
   /**
     * Schedules a message to arrive a certain point in time in the future.
@@ -866,10 +1036,12 @@ class Ccp[A](
       // No need to keep payments if VMGH is done.
       if (currentStage == VMGH) tryReleasePayments(t)
 
-      for {
+      val switchStateMessageO = for {
         s <- waterfall.next(currentStage)
         message = toInternalStage(s)(member, loss)
-      } yield scheduleMessage(t, self, message)
+      } yield scheduledMessage(t, self, message)
+
+      scheduler ! switchStateMessageO.getOrElse(throw new IllegalStateException())
     } else {
       // Nothing left to do... shortcircuit the waterfall.
       tryReleasePayments(t)
@@ -883,18 +1055,20 @@ object Ccp {
                waterfall: Waterfall,
                memberPortfolios: Map[ActorRef, Portfolio],
                ccpPortfolios: => Map[ActorRef, Portfolio],
-               assets: Map[Time, BigDecimal],
+               capital: Portfolio,
                rules: Rules,
                operationalDelays: OperationalDelays,
+               market: ActorRef,
                scheduler: ActorRef): Props = {
     Props(
       new Ccp(name,
               waterfall,
               memberPortfolios,
               ccpPortfolios,
-              assets,
+              capital,
               rules,
               operationalDelays,
+              market,
               scheduler))
   }
 
@@ -924,8 +1098,8 @@ object Ccp {
 
   case class OperationalDelays(
       callHandling: Time,
-      coverWithDefaultedMargin: Time,
-      coverWithDefaultedFund: Time,
+      coverWithMargin: Time,
+      coverWithFund: Time,
       coverWithSurvivorsMargins: Time,
       coverWithSurvivorsFunds: Time,
       computeSurvivorsUnfunded: Time,
@@ -952,9 +1126,12 @@ object Ccp {
 
   private case class AddExpectedPayment(member: ActorRef, id: RequestId, payment: BigDecimal)
   private case class RemoveExpectedPayment(member: ActorRef, id: RequestId)
-  private case class UpdateMargin(member: ActorRef, margin: BigDecimal)
   private case class UpdateFund(member: ActorRef, fund: BigDecimal)
   private case class UpdateUnfunded(member: ActorRef, unfund: BigDecimal)
   private case class AddDefaulted(member: ActorRef)
-  private case class AddPaymentDue(member: ActorRef, payment: BigDecimal)
+  private case class TriggerDefault(member: ActorRef, paymentLeft: BigDecimal, t: Time)
+  private case class NextStage(currentStage: WaterfallStage,
+                               member: ActorRef,
+                               loss: BigDecimal,
+                               t: Time)
 }

@@ -12,14 +12,14 @@ import market.Market.{Index, Margin, Price}
 import spire.implicits._
 import spire.math
 import structure.Timed.{Time, res, _}
+import util.Result.Result
 
 import scala.collection._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.concurrent.duration._
-import scalaz.std.list._
-import scalaz.std.option._
-import scalaz.syntax.traverse._
+import scalaz.Scalaz._
+import scalaz._
 
 /**
   * Provides the prices for any point in time.
@@ -31,7 +31,8 @@ import scalaz.syntax.traverse._
 case class Market(prices: Map[Security, BigDecimal],
                   indexes: Map[Security, Index],
                   retDistr: MultivariateGaussian,
-                  scaling: Int)
+                  scaling: Int,
+                  data: Option[Map[Time, Map[Security, BigDecimal]]])
     extends Actor {
   private val icdf = (p: Double) => BigDecimal(Gaussian(0, 1).icdf(p))
 
@@ -44,7 +45,7 @@ case class Market(prices: Map[Security, BigDecimal],
   def receive: Receive = {
     case Price(i, t) => sender ! price(i, t)
     case Margin(portfolio, coverage, timeHorizon, t) =>
-      margin(portfolio, coverage, timeHorizon, t) pipeTo sender
+      margin(portfolio, coverage, timeHorizon, t).run pipeTo sender
   }
 
   /**
@@ -53,7 +54,7 @@ case class Market(prices: Map[Security, BigDecimal],
     * @param instrument instrument
     * @return the price for the instrument at the given time.
     */
-  private def price(instrument: Security, time: Time): BigDecimal = {
+  private def price(instrument: Security, time: Time): Option[BigDecimal] = {
 
     /**
       * Helper function for generating prices for a specific point in time.
@@ -61,44 +62,47 @@ case class Market(prices: Map[Security, BigDecimal],
       * @param t point in time of prices.
       * @return prices for point in time t.
       */
-    def generatePrices(t: Time): Option[Map[Security, BigDecimal]] = {
-      val returns = retDistr.draw().map(BigDecimal(_))
+    def generatePrices(t: Time): Option[Map[Security, BigDecimal]] = data match {
+      case Some(d) => d.get(t)
 
-      val newPsO = indexes.keys.toList
-        .traverse[Option, (Security, BigDecimal)](security =>
-          for {
-            // If the data does not exist, recursively generate it.
-            ps <- generatedPrices.get(t - tick).orElse(generatePrices(t - tick))
-            p <- ps.get(security)
-            i <- indexes.get(security)
-            r = returns(i)
-          } yield {
-            // Store the generated past data.
-            // Might just overwrite the same if it already existed.
-            generatedPrices += (t - tick) -> ps
+      case None =>
+        val returns = retDistr.draw().map(BigDecimal(_))
 
-            // Price cannot be negative
-            security -> ((p * (1 + (r / scaling))) max 0)
-        })
-        .map(_.toMap)
+        val newPsO = indexes.keys.toList
+          .traverse[Option, (Security, BigDecimal)](security =>
+            for {
+              // If the data does not exist, recursively generate it.
+              ps <- generatedPrices.get(t - tick).orElse(generatePrices(t - tick))
+              p <- ps.get(security)
+              i <- indexes.get(security)
+              r = returns(i)
+            } yield {
+              // Store the generated past data.
+              // Might just overwrite the same if it already existed.
+              generatedPrices += (t - tick) -> ps
 
-      // Store the new generated data.
-      newPsO.foreach(newPs => generatedPrices += t -> newPs)
+              // Price cannot be negative
+              security -> ((p * (1 + (r / scaling))) max 0)
+          })
+          .map(_.toMap)
 
-      for {
-        newPs <- newPsO
-      } {
-        Future {
-          val writer = CSVWriter.open(f, append = true)
-          val stringifiedTime = t.toUnit(res).toString
-          val stringifiedPs = newPs.values.map(_.toString)
-          val row = Iterable(stringifiedTime) ++ stringifiedPs
-          writer.writeRow(row.toSeq)
-          writer.close()
+        // Store the new generated data.
+        newPsO.foreach(newPs => generatedPrices += t -> newPs)
+
+        for {
+          newPs <- newPsO
+        } {
+          Future {
+            val writer = CSVWriter.open(f, append = true)
+            val stringifiedTime = t.toUnit(res).toString
+            val stringifiedPs = newPs.values.map(_.toString)
+            val row = Iterable(stringifiedTime) ++ stringifiedPs
+            writer.writeRow(row.toSeq)
+            writer.close()
+          }
         }
-      }
 
-      newPsO
+        newPsO
     }
 
     val price = generatedPrices.get(time) match {
@@ -111,7 +115,7 @@ case class Market(prices: Map[Security, BigDecimal],
         } yield p
     }
 
-    price.getOrElse(throw new IllegalStateException())
+    price
   }
 
   /**
@@ -125,7 +129,7 @@ case class Market(prices: Map[Security, BigDecimal],
   private def margin(portfolio: Portfolio,
                      coverage: BigDecimal,
                      timeHorizon: Time,
-                     t: Time): Future[BigDecimal] = {
+                     t: Time): Result[BigDecimal] = {
     logger.debug(s"Computing margin of portfolio $portfolio")
 
     // Set of positions in the portfolio.
@@ -151,22 +155,22 @@ case class Market(prices: Map[Security, BigDecimal],
               .sortBy(_._1)
               .map(_._2))
 
-        _ = logger.debug(s"pWeights $pWeights")
+//        _ = logger.debug(s"pWeights $pWeights")
 
         price <- Portfolio.price(portfolio)(t)
 
-        _ = logger.debug(s"price $price")
+//        _ = logger.debug(s"price $price")
 
         weightsVec = DenseVector(pWeights: _*).map(_.doubleValue)
 
-        _ = logger.debug(s"weightsVec $weightsVec")
+//        _ = logger.debug(s"weightsVec $weightsVec")
 
         // Covariance matrix stripped from the instruments not in the portfolio.
         cov = retDistr.covariance
           .delete(indexesToStrip.toSeq, Axis._0)
           .delete(indexesToStrip.toSeq, Axis._1)
 
-        _ = logger.debug(s"cov $cov")
+//        _ = logger.debug(s"cov $cov")
 
         pVar = BigDecimal(weightsVec.t * cov * weightsVec) / scaling
 
@@ -181,7 +185,11 @@ case class Market(prices: Map[Security, BigDecimal],
         // Market mean vector stripped from the instruments not in the portfolio.
         muVec = retDistr.mean.toDenseMatrix.delete(indexesToStrip.toSeq, Axis._1).toDenseVector
 
-        pMu = BigDecimal((muVec :* weightsVec.toDenseVector).toArray.sum) / scaling
+        pMu = BigDecimal(muVec.t * weightsVec) / scaling
+
+//        _ = logger.debug(s"pMu $pMu")
+
+//        _ = logger.debug(s"Horizon ${timeHorizon.toUnit(res)}")
 
         // Return over horizon
         pMuHorizon = ((1 + pMu) ** timeHorizon.toUnit(res)) - 1
@@ -189,18 +197,19 @@ case class Market(prices: Map[Security, BigDecimal],
         // If base portfolio is long we take lower bound as we need to cover from a price drop.
         // We do the opposite for a short portfolio.
         // We can do this as the returns of the portfolio are normally distributed.
-        ret = if (price >= 0) pMuHorizon - pSigmaHorizon * zScore
+        ret = if (price >= 0)
+          (pMuHorizon - pSigmaHorizon * zScore) max -1 // Cannot lose more than 100% if long
         else pMuHorizon + pSigmaHorizon * zScore
 
-        _ = logger.debug(s"$portfolio -> $pMuHorizon +- $pSigmaHorizon * $zScore")
-        _ = logger.debug(s"$portfolio -> $ret * $price")
+//        _ = logger.debug(s"$portfolio -> $pMuHorizon +- $pSigmaHorizon * $zScore")
+//        _ = logger.debug(s"$portfolio -> $ret * $price")
 
         valueAtRisk = price * ret
 
         // Only take margin if the value at risk is negative. For instance it could be
         m = -valueAtRisk max 0
 
-        _ = logger.debug(s"m $m")
+//        _ = logger.debug(s"m $m")
       } yield m // valueAtRisk is negative, we flip the sign.
     }
   }
@@ -215,5 +224,7 @@ object Market {
   def props(prices: Map[Security, BigDecimal],
             indexes: Map[Security, Index],
             retDistr: MultivariateGaussian,
-            scaling: Int): Props = Props(Market(prices, indexes, retDistr, scaling))
+            scaling: Int,
+            data: Option[Map[Time, Map[Security, BigDecimal]]]): Props =
+    Props(Market(prices, indexes, retDistr, scaling, data))
 }

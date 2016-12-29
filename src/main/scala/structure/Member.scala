@@ -3,6 +3,7 @@ package structure
 import java.io.File
 
 import akka.actor.{Actor, ActorRef, Props}
+import akka.event.LoggingReceive
 import akka.pattern.pipe
 import com.github.tototoshi.csv.CSVWriter
 import com.typesafe.scalalogging.Logger
@@ -15,7 +16,8 @@ import util.Result
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
-import scalaz.std.scalaFuture._
+import scalaz.Scalaz._
+import scalaz._
 
 /**
   * Describes a clearinghouse member. It responds to calls from CCPs using its assets to pay for it.
@@ -29,64 +31,64 @@ case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler:
   private var currentTime = zero
   private val logger = Logger(name)
   private val f = new File(s"$name.csv")
-  private var _capital = Future.successful(capital)
+  private var _capital = Result.pure(capital)
 
-  override def receive: Receive = {
+  override def receive: Receive = LoggingReceive {
     case Paid => sender ! totalPaid
 
     case TimedMessage(t, m) =>
       assert(t >= currentTime, "Received message from the past.")
       currentTime = currentTime max t
 
+      val currentCapital = _capital
+
+      val origSender = sender
+
       m match {
+        case Transfer(payment) =>
+          require(payment >= 0)
+
+          val newCapital = for {
+            c <- currentCapital
+            (newC, _) <- buyAll(c)(payment, t)
+          } yield newC
+
+          // Reinvestment not fail
+          _capital = newCapital
+
         case MarginCall(id, payment, maxDelay) =>
-          val origSender = sender
+          require(payment >= 0)
 
           writeToCsv(t, payment)
 
-          if (payment < 0) {
-            // Always answer.
-            scheduleMessage(t, origSender, MarginCallResponse(id, self, payment))
+          val newCapitalAndTimeF = for {
+            c <- currentCapital
+            (newCap, timeToSell) <- sellAll(c)(payment, t)
+            if timeToSell <= maxDelay
+          } yield (newCap, timeToSell)
 
-            val newCapital = for {
-              c <- Result.fromFuture(_capital)
-              (newC, _) <- buyAll(c)(payment, t)
-            } yield newC
+          val newCapitalF = newCapitalAndTimeF.map(_._1)
+          val timeToSellF = newCapitalAndTimeF.map(_._2)
 
-            // Reinvestment not fail
-            _capital = newCapital | (throw new IllegalStateException())
-          } else {
-            val newCapitalAndTimeF = for {
-              c <- Result.fromFuture(_capital)
-              (newCap, timeToSell) <- sellAll(c)(payment, t)
-              if timeToSell <= maxDelay
-            } yield (newCap, timeToSell)
+          // Fails if not enough was sold or on time, reassign same capital
+          _capital = newCapitalF ||| currentCapital
 
-            val newCapitalF = newCapitalAndTimeF.map(_._1)
-            val timeToSellF = newCapitalAndTimeF.map(_._2)
+          val response = ((timeToSellF | Timed.zero) |@| (timeToSellF.map(_ => payment) | 0))(
+            (timeToSell, raisedAmount) => {
+              scheduledMessage(t + timeToSell,
+                               origSender,
+                               MarginCallResponse(id, self, raisedAmount))
+            })
 
-            // Fails if not enough was sold or on time, reassign same capital
-            _capital = newCapitalF getOrElseF _capital
-
-            val responseMessage = for {
-              timeToSell <- timeToSellF
-            } yield
-              scheduledMessage(t + timeToSell, origSender, MarginCallResponse(id, self, payment))
-
-            val defaultResponseMessage =
-              scheduledMessage(t, origSender, MarginCallResponse(id, self, 0))
-
-            // Fails if not enough was sold or on time, sends 0.
-            responseMessage | defaultResponseMessage pipeTo scheduler
-          }
+          response pipeTo scheduler
 
         case DefaultFundCall(id, payment, maxDelay) =>
-          val origSender = sender
+          require(payment >= 0)
 
           writeToCsv(t, payment)
 
           val newCapitalAndTimeF = for {
-            c <- Result.fromFuture(_capital)
+            c <- currentCapital
             (newCap, timeToSell) <- sellAll(c)(payment, t)
             if timeToSell <= maxDelay
           } yield (newCap, timeToSell)
@@ -95,28 +97,24 @@ case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler:
           val timeToSellF = newCapitalAndTimeF.map(_._2)
 
           // Fails if not enough was sold or on time, reassign same capital
-          _capital = newCapitalF getOrElseF _capital
+          _capital = newCapitalF ||| currentCapital
 
-          val responseMessage = for {
-            timeToSell <- timeToSellF
-          } yield
-            scheduledMessage(t + timeToSell,
-                             origSender,
-                             DefaultFundCallResponse(id, self, payment))
+          val response = ((timeToSellF | Timed.zero) |@| (timeToSellF.map(_ => payment) | 0))(
+            (timeToSell, raisedAmount) => {
+              scheduledMessage(t + timeToSell,
+                               origSender,
+                               DefaultFundCallResponse(id, self, raisedAmount))
+            })
 
-          val defaultResponseMessage =
-            scheduledMessage(t, origSender, DefaultFundCallResponse(id, self, 0))
-
-          // Fails if not enough was sold or on time, sends 0.
-          responseMessage | defaultResponseMessage pipeTo scheduler
+          response pipeTo scheduler
 
         case UnfundedDefaultFundCall(id, waterfallId, payment, maxDelay) =>
-          val origSender = sender
+          require(payment >= 0)
 
           writeToCsv(t, payment)
 
           val newCapitalAndTimeF = for {
-            c <- Result.fromFuture(_capital)
+            c <- currentCapital
             (newCap, timeToSell) <- sellAll(c)(payment, t)
             if timeToSell <= maxDelay
           } yield (newCap, timeToSell)
@@ -125,51 +123,18 @@ case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler:
           val timeToSellF = newCapitalAndTimeF.map(_._2)
 
           // Fails if not enough was sold or on time, reassign same capital
-          _capital = newCapitalF getOrElseF _capital
+          _capital = newCapitalF ||| currentCapital
 
-          val responseMessage = for {
-            timeToSell <- timeToSellF
-          } yield
+          val response = ((timeToSellF | Timed.zero) |@| (timeToSellF
+            .map(_ => payment) | 0))((timeToSell, raisedAmount) => {
             scheduledMessage(t + timeToSell,
                              origSender,
-                             UnfundedDefaultFundCallResponse(id, waterfallId, self, payment))
+                             UnfundedDefaultFundCallResponse(id, waterfallId, self, raisedAmount))
+          })
 
-          val defaultResponseMessage =
-            scheduledMessage(t,
-                             origSender,
-                             UnfundedDefaultFundCallResponse(id, waterfallId, self, 0))
-
-          // Fails if not enough was sold or on time, sends 0.
-          responseMessage | defaultResponseMessage pipeTo scheduler
+          response pipeTo scheduler
       }
   }
-
-//  /**
-//    * Updates the member with its new assets and what has been paid for the call.
-//    * @param assets new assets.
-//    * @param payment additional payment.
-//    */
-//  private def update(portfolio: Portfolio, payment: BigDecimal, t: Time): Unit = {
-//    _assets = assets
-//
-//    writeToCsv(t, -payment)
-//
-//    totalPaid += payment
-//  }
-
-//  /**
-//    * Updates the assets with the payment. Liquidity is assumed to be 0.
-//    * @param payment payment to add.
-//    */
-//  private def updateAssets(payment: BigDecimal, t: Time): Unit = {
-//    writeToCsv(t, payment)
-//
-//    for {
-//      currentAmount <- _assets.get(zero)
-//
-//      _ = _assets += zero -> (currentAmount + payment)
-//    } yield ()
-//  }
 
   private def writeToCsv(t: Time, payment: BigDecimal): Unit = {
     Future {

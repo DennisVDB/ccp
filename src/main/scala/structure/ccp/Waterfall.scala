@@ -10,7 +10,7 @@ case class Waterfall(stages: Map[WaterfallStage, WaterfallStage]) {
 }
 
 object Waterfall {
-  trait WaterfallStage
+  sealed trait WaterfallStage
   case object Start extends WaterfallStage
   case object Defaulted extends WaterfallStage
   case object Survivors extends WaterfallStage
@@ -19,4 +19,5 @@ object Waterfall {
   case object SecondLevelEquity extends WaterfallStage
   case object VMGH extends WaterfallStage
   case object End extends WaterfallStage
+  case object Failed extends WaterfallStage
 }

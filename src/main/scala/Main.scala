@@ -9,6 +9,7 @@ import structure._
 import structure.ccp.Ccp._
 import structure.ccp.Waterfall.{End, Start, _}
 import structure.ccp.{Ccp, Waterfall}
+import util.DataUtil.readCsv
 
 import scala.concurrent.duration._
 import scala.language.postfixOps
@@ -17,7 +18,6 @@ import scala.language.postfixOps
   * Created by dennis on 8/10/16.
   */
 object Main extends App {
-
   implicit val timeout: Timeout = Timeout(60 seconds)
 
   val system = ActorSystem("System", ConfigFactory.load())
@@ -44,16 +44,18 @@ object Main extends App {
         Map(pos1 -> BigDecimal("10000"), pos2 -> BigDecimal("5000"), pos3 -> BigDecimal("3000"), sp500 -> BigDecimal("100")),
       indexes = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3),
       retDistr = MultivariateGaussian(
-        DenseVector(0.0, 0.0, 0.0, 0.0),
+        DenseVector(-0.5, 0.0, 0.0, 0.0),
         DenseMatrix((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
       ),
-      scaling = 100
+      scaling = 100, Some(readCsv("out", Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3)))
     ))
+
+  // Some(readCsv("out", Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3)))
 
   val longPortfolio = Portfolio(Map(pos1 -> 1), market)
   val longPortfolio3 = Portfolio(Map(pos1 -> 1, pos2 -> -30, pos3 -> 100), market)
   val shortPortfolio = longPortfolio.inverse
-  val emptyPortfolio = Portfolio(Map.empty[Security, BigDecimal], market)
+  val emptyPortfolio = Portfolio(Map(pos3 -> 0), market)
   val capital = Portfolio(Map(sp500 -> 1), market)
 
   implicit val scheduler = system.actorOf(Scheduler.props(15 milliseconds))
@@ -92,7 +94,7 @@ object Main extends App {
     system.actorOf(
       Member.props(
         name = "member 4",
-        capital = capital,
+        capital = emptyPortfolio,
         market = market,
         scheduler = scheduler
       )
@@ -117,11 +119,11 @@ object Main extends App {
   lazy val ccp1: ActorRef = system.actorOf(
     Ccp.props[Security](
       name = "ccp1",
-      waterfall = arnsdorfWaterfall,
+      waterfall = isdaWaterfall,
       memberPortfolios = Map(
-        member1 -> longPortfolio
-//        member3 -> longPortfolio,
-//        member4 -> shortPortfolio
+        member1 -> longPortfolio,
+        member3 -> longPortfolio,
+        member4 -> shortPortfolio
       ),
       ccpPortfolios = Map.empty[ActorRef, Portfolio], // Map(ccp2 -> longPortfolio),
       capital = capital,

@@ -2,11 +2,8 @@ package util
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
-import scalaz.std.option._
-import scalaz.std.scalaFuture._
-import scalaz.syntax.applicative._
-import scalaz.syntax.traverse._
-import scalaz.{Functor, Monoid, OptionT}
+import scalaz.Scalaz._
+import scalaz._
 
 /**
   * Created by dennis on 26/12/16.
@@ -29,15 +26,17 @@ object Result {
 
   def pure[A](a: A): Result[A] = a.point[Result]
 
-  def collect[A](a: Result[A]): Future[A] = a.run.collect { case Some(aa) => aa }
+  def collect[A](a: Result[A]): Future[A] = a.run.collect {
+    case Some(aa) => aa
+    case None => throw new IllegalStateException("Could not collect.")
+  }
 
-  implicit val ResultFunctor = new Functor[Result] {
+  implicit val resultFunctor = new Functor[Result] {
     def map[A, B](fa: Result[A])(f: A => B): Result[B] = fa map f
   }
 
-  implicit def BigDecimalAdditionMonoid = new Monoid[BigDecimal] {
-    def zero: BigDecimal = 0
-
-    def append(f1: BigDecimal, f2: => BigDecimal): BigDecimal = f1 + f2
+  implicit def resultMonoid[A: Monoid]: Monoid[Result[A]] = new Monoid[Result[A]] {
+    def zero: Result[A] = Monoid[A].zero.point[Result]
+    def append(f1: Result[A], f2: => Result[A]): Result[A] = (f1 |@| f2) { _ |+| _ }
   }
 }

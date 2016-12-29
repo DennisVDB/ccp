@@ -27,6 +27,10 @@ case class UnfundedDefaultFundCall(id: RequestId,
 case class UnfundedDefaultFundCallResponse(waterfallId: RequestId, id: RequestId, counterParty: ActorRef, payment: BigDecimal)
     extends CcpProtocol
 
+case class Transfer(payment: BigDecimal) extends CcpProtocol
+
+case class FailedStage(stage: Waterfall.WaterfallStage) extends CcpProtocol
+
 case object Paid extends CcpProtocol
 
 class RequestId(val id: String) extends AnyVal

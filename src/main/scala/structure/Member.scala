@@ -3,7 +3,6 @@ package structure
 import java.io.File
 
 import akka.actor.{Actor, ActorRef, Props}
-import akka.event.LoggingReceive
 import akka.pattern.pipe
 import com.github.tototoshi.csv.CSVWriter
 import com.typesafe.scalalogging.Logger
@@ -12,12 +11,12 @@ import market.Portfolio.{buyAll, sellAll}
 import structure.Scheduler.scheduledMessage
 import structure.Timed._
 import structure.ccp._
+import util.DataUtil.ec
 import util.Result
 
-import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
+//import scala.concurrent.ExecutionContext.Implicits.globalimport scala.concurrent.Future
 import scalaz.Scalaz._
-import scalaz._
 
 /**
   * Describes a clearinghouse member. It responds to calls from CCPs using its assets to pay for it.
@@ -33,7 +32,7 @@ case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler:
   private val f = new File(s"$name.csv")
   private var _capital = Result.pure(capital)
 
-  override def receive: Receive = LoggingReceive {
+  override def receive: Receive = {
     case Paid => sender ! totalPaid
 
     case TimedMessage(t, m) =>
@@ -61,11 +60,10 @@ case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler:
 
           writeToCsv(t, payment)
 
-          val newCapitalAndTimeF = for {
+          val newCapitalAndTimeF = (for {
             c <- currentCapital
             (newCap, timeToSell) <- sellAll(c)(payment, t)
-            if timeToSell <= maxDelay
-          } yield (newCap, timeToSell)
+          } yield (newCap, timeToSell)).ensure(s"Not sold on time for $name")(_._2 <= maxDelay)
 
           val newCapitalF = newCapitalAndTimeF.map(_._1)
           val timeToSellF = newCapitalAndTimeF.map(_._2)
@@ -87,11 +85,10 @@ case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler:
 
           writeToCsv(t, payment)
 
-          val newCapitalAndTimeF = for {
+          val newCapitalAndTimeF = (for {
             c <- currentCapital
             (newCap, timeToSell) <- sellAll(c)(payment, t)
-            if timeToSell <= maxDelay
-          } yield (newCap, timeToSell)
+          } yield (newCap, timeToSell)).ensure(s"Not sold on time for $name.")(_._2 <= maxDelay)
 
           val newCapitalF = newCapitalAndTimeF.map(_._1)
           val timeToSellF = newCapitalAndTimeF.map(_._2)
@@ -113,11 +110,10 @@ case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler:
 
           writeToCsv(t, payment)
 
-          val newCapitalAndTimeF = for {
+          val newCapitalAndTimeF = (for {
             c <- currentCapital
             (newCap, timeToSell) <- sellAll(c)(payment, t)
-            if timeToSell <= maxDelay
-          } yield (newCap, timeToSell)
+          } yield (newCap, timeToSell)).ensure(s"Not sold on time for $name.")(_._2 <= maxDelay)
 
           val newCapitalF = newCapitalAndTimeF.map(_._1)
           val timeToSellF = newCapitalAndTimeF.map(_._2)

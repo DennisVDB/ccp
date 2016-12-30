@@ -12,11 +12,11 @@ import market.Market.{Index, Margin, Price}
 import spire.implicits._
 import spire.math
 import structure.Timed.{Time, res, _}
+import util.DataUtil.ec
 import util.Result.Result
 
-import scala.collection._
-import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
+//import scala.concurrent.ExecutionContext.Implicits.globalimport scala.concurrent.Future
 import scala.concurrent.duration._
 import scalaz.Scalaz._
 import scalaz._
@@ -54,7 +54,7 @@ case class Market(prices: Map[Security, BigDecimal],
     * @param instrument instrument
     * @return the price for the instrument at the given time.
     */
-  private def price(instrument: Security, time: Time): Option[BigDecimal] = {
+  private def price(instrument: Security, time: Time): \/[String, BigDecimal] = {
 
     /**
       * Helper function for generating prices for a specific point in time.
@@ -115,7 +115,7 @@ case class Market(prices: Map[Security, BigDecimal],
         } yield p
     }
 
-    price
+    price \/> s"Could not get price for $instrument @$time"
   }
 
   /**

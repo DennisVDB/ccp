@@ -1,15 +1,16 @@
 package util
 
+import java.util.concurrent.Executors
+
 import com.github.tototoshi.csv.CSVReader
 import market.Market.Index
 import market.Security
 import structure.Timed
 import structure.Timed.Time
 
-import scala.collection.Map
-import scala.concurrent.ExecutionContext.Implicits.global
-import scala.concurrent.Future
+//import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.{ExecutionContext, Future}
 
 /**
   * Created by dennis on 12/10/16.
@@ -60,7 +61,10 @@ object DataUtil {
     foo
   }
 
-//  def bigDecimalMonoid = new Monoid[BigDecimal] {
+  implicit val ec = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(1))
+
+
+  //  def bigDecimalMonoid = new Monoid[BigDecimal] {
 //    def zero: BigDecimal = BigDecimal(0)
 //
 //    def append(f1: BigDecimal, f2: => BigDecimal): BigDecimal = f1 + f2

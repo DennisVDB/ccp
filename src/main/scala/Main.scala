@@ -11,6 +11,7 @@ import structure.ccp.Waterfall.{End, Start, _}
 import structure.ccp.{Ccp, Waterfall}
 import util.DataUtil.readCsv
 
+import scala.collection.immutable._
 import scala.concurrent.duration._
 import scala.language.postfixOps
 
@@ -38,16 +39,24 @@ object Main extends App {
 //      scaling = 100
 //    ))
 
+  val bla = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3)
+
   val market = system.actorOf(
     Market.props(
-      prices =
-        Map(pos1 -> BigDecimal("10000"), pos2 -> BigDecimal("5000"), pos3 -> BigDecimal("3000"), sp500 -> BigDecimal("100")),
+      prices = Map(pos1 -> BigDecimal("10000"),
+                   pos2 -> BigDecimal("5000"),
+                   pos3 -> BigDecimal("3000"),
+                   sp500 -> BigDecimal("100")),
       indexes = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3),
       retDistr = MultivariateGaussian(
         DenseVector(-0.5, 0.0, 0.0, 0.0),
-        DenseMatrix((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        DenseMatrix((1.0, 0.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0))
       ),
-      scaling = 100, Some(readCsv("out", Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3)))
+      scaling = 100,
+      Some(readCsv("out", bla))
     ))
 
   // Some(readCsv("out", Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3)))
@@ -58,7 +67,7 @@ object Main extends App {
   val emptyPortfolio = Portfolio(Map(pos3 -> 0), market)
   val capital = Portfolio(Map(sp500 -> 1), market)
 
-  implicit val scheduler = system.actorOf(Scheduler.props(15 milliseconds))
+  val scheduler = system.actorOf(Scheduler.props(15 milliseconds))
 
   val member1 =
     system.actorOf(

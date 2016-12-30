@@ -1,6 +1,7 @@
 package util
 
-import scala.concurrent.ExecutionContext.Implicits.global
+import util.DataUtil.ec
+//import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scalaz.Scalaz._
 import scalaz._
@@ -9,34 +10,47 @@ import scalaz._
   * Created by dennis on 26/12/16.
   */
 object Result {
-  type Result[A] = OptionT[Future, A]
+  type E = String
+  type Result[A] = EitherT[Future, E, A]
 
-  def apply[A](a: Future[Option[A]]): Result[A] = OptionT(a)
+  def apply[A](a: Future[E \/ A]): Result[A] = EitherT(a)
 
-  def fromOption[A](a: Option[A]): Result[A] = OptionT(a.point[Future])
+  def fromOption[A](a: E \/ A): Result[A] = EitherT(a.point[Future])
 
-  def fromFuture[A](a: Future[A]): Result[A] = OptionT(a.map(Option(_)))
+  def fromFuture[A](a: Future[A]): Result[A] =
+    EitherT[Future, E, A](a.map(\/-(_)))
 
-  def fromOptFut[A](a: Option[Future[A]]): Result[A] = OptionT(a.sequence)
+  def fromOptFut[A](a: E \/ Future[A]): Result[A] = EitherT(a.sequence)
 
-  def fromOptRes[A](a: Option[Result[A]]): Result[A] =
-    OptionT(a.map(_.run).sequence.map(_.flatten))
+  def fromOptRes[A](a: E \/ Result[A]): Result[A] =
+    EitherT(a.traverse(_.run).map {
+      case -\/(e) => -\/(e)
+      case \/-(x) =>
+        x match {
+          case -\/(ee) => -\/(ee)
+          case \/-(a) => \/-(a)
+        }
+    })
 
-  def fromFutureRes[A](a: Future[Result[A]]): Result[A] = Result(a.map(_.run).flatMap(identity))
+//  EitherT(a.map(_.run).sequence.map(_.flatten))
 
-  def pure[A](a: A): Result[A] = a.point[Result]
+  def fromFutureRes[A](a: Future[Result[A]]): Result[A] =
+    Result(a.map(_.run).flatMap(identity))
 
-  def collect[A](a: Result[A]): Future[A] = a.run.collect {
-    case Some(aa) => aa
-    case None => throw new IllegalStateException("Could not collect.")
+  def pure[E, A](a: A): Result[A] = a.point[Result]
+
+  def unsafeCollect[E, A](a: Result[A]): Future[A] = a.run.collect {
+    case \/-(a) => a
+    case -\/(e) => throw new IllegalStateException(e.toString())
   }
 
-  implicit val resultFunctor = new Functor[Result] {
-    def map[A, B](fa: Result[A])(f: A => B): Result[B] = fa map f
-  }
+//  implicit val resultFunctor = new Functor[Result] {
+//    def map[A, B](fa: Result[A])(f: (A) => B): Result[B] = ???
+//  }
 
   implicit def resultMonoid[A: Monoid]: Monoid[Result[A]] = new Monoid[Result[A]] {
     def zero: Result[A] = Monoid[A].zero.point[Result]
+
     def append(f1: Result[A], f2: => Result[A]): Result[A] = (f1 |@| f2) { _ |+| _ }
   }
 }

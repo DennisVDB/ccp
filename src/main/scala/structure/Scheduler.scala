@@ -4,9 +4,10 @@ import akka.actor.{Actor, ActorRef, Props}
 import com.typesafe.scalalogging.Logger
 import structure.Scheduler.{Release, Run, ScheduledMessage}
 import structure.Timed._
+import util.DataUtil.ec
 
 import scala.collection.mutable
-import scala.concurrent.ExecutionContext.Implicits.global
+//import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 
 /**

@@ -7,10 +7,10 @@ import com.typesafe.scalalogging.Logger
 import market.Market.{Margin, Price}
 import market.Portfolio.price
 import structure.Timed.{Time, zero}
+import util.DataUtil.ec
 import util.Result
 import util.Result.{Result, resultMonoid}
-
-import scala.concurrent.ExecutionContext.Implicits.global
+//import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.language.postfixOps
 import scalaz.Scalaz._
@@ -35,7 +35,7 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: ActorRef) {
       .traverse[Result, (Security, BigDecimal)] {
         case (item, amount) => {
           for {
-            p <- Result((market ? Price(item, t)).mapTo[Option[BigDecimal]])
+            p <- Result((market ? Price(item, t)).mapTo[String \/ BigDecimal])
             total <- price(this)(t)
             weight = (p * amount) / total
           } yield item -> weight
@@ -53,7 +53,7 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: ActorRef) {
     */
   def margin(t: Time)(coverage: BigDecimal, timeHorizon: Time): Result[BigDecimal] = {
     if (isEmpty) Result.pure(0)
-    else Result((market ? Margin(this, coverage, timeHorizon, t)).mapTo[Option[BigDecimal]])
+    else Result((market ? Margin(this, coverage, timeHorizon, t)).mapTo[String \/ BigDecimal])
   }
 
   /**
@@ -68,22 +68,22 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: ActorRef) {
     * @return
     */
   def replacementCost(t: Time): Result[(BigDecimal, Time)] = {
-    val costsF = positions.toList
-      .traverse[Result, BigDecimal] {
-        case (item, amount) if amount < 0 =>
-          val price =
-            Result((market ? Price(item, t + closeoutPeriod(amount))).mapTo[Option[BigDecimal]])
-          price.map(-_ * amount)
+    val costF = positions.toList.map {
+      case (item, amount) if amount < 0 =>
+        val price =
+          Result((market ? Price(item, t + closeoutPeriod(amount))).mapTo[String \/ BigDecimal])
+        price.map(-_ * amount)
 
-        case (_, amount) if amount >= 0 =>
-          Result.pure(0)
-      }
+      case (_, amount) if amount >= 0 =>
+        Result.pure(BigDecimal(0))
+    }.suml
 
     val timeToCloseOut = positions.map {
       case (_, amount) if amount < 0 => closeoutPeriod(amount)
+      case _ => zero
     }.max
 
-    costsF.map(costs => (costs.sum, timeToCloseOut))
+    costF.map(cost => (cost, timeToCloseOut))
   }
 
   def closeoutPeriod(amount: BigDecimal): Time = 15 minutes
@@ -116,7 +116,7 @@ object Portfolio {
       .map({
         case (item, amount) =>
           for {
-            price <- Result((p.market ? Price(item, t)).mapTo[Option[BigDecimal]])
+            price <- Result((p.market ? Price(item, t)).mapTo[String \/ BigDecimal])
           } yield price * amount
       })
       .suml
@@ -125,13 +125,14 @@ object Portfolio {
   def perform(p: Portfolio)(security: Security, cash: BigDecimal, t: Time)(
       f: (BigDecimal, BigDecimal) => BigDecimal) = {
     for {
-      currentAmount <- Result.fromOption(p.positions.get(security))
+      currentAmount <- Result.fromOption(
+        p.positions.get(security) \/> s"Could not get position for security $security.")
 
       wasLong = currentAmount >= 0
 
       performTime = t + p.closeoutPeriod(cash)
 
-      price <- Result((p.market ? Market.Price(security, performTime)).mapTo[Option[BigDecimal]])
+      price <- Result((p.market ? Market.Price(security, performTime)).mapTo[String \/ BigDecimal])
       if price != 0
 
       newAmount = f(currentAmount, cash / price)
@@ -153,8 +154,9 @@ object Portfolio {
       (work: Result[(Portfolio, Time)]) =>
         for {
           (p, currentTimeToPerform) <- work
-          price <- Result((p.market ? Price(security, t)).mapTo[Option[BigDecimal]])
-          amount <- Result.fromOption(p.positions.get(security))
+          price <- Result((p.market ? Price(security, t)).mapTo[String \/ BigDecimal])
+          amount <- Result.fromOption(
+            p.positions.get(security) \/> s"Could not get position for security $security.")
 
           totalPrice <- totalPriceF
 

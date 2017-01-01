@@ -3,11 +3,10 @@ package structure
 import java.io.File
 
 import akka.actor.{Actor, ActorRef, Props}
-import akka.pattern.pipe
 import com.github.tototoshi.csv.CSVWriter
 import com.typesafe.scalalogging.Logger
 import market.Portfolio
-import market.Portfolio.{buyAll, sellAll}
+import market.Portfolio.{Transaction, buyAll, sellAll}
 import structure.Scheduler.scheduledMessage
 import structure.Timed._
 import structure.ccp._
@@ -15,8 +14,6 @@ import util.DataUtil.ec
 import util.Result
 
 import scala.concurrent.Future
-//import scala.concurrent.ExecutionContext.Implicits.globalimport scala.concurrent.Future
-import scalaz.Scalaz._
 
 /**
   * Describes a clearinghouse member. It responds to calls from CCPs using its assets to pay for it.
@@ -24,7 +21,7 @@ import scalaz.Scalaz._
   * @param capital the assets owned with their respective liquidity.
   * @param scheduler message scheduler in order to send them in order.
   */
-case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler: ActorRef)
+case class Member(name: String, capital: Portfolio, scheduler: ActorRef)
     extends Actor {
   private var totalPaid: BigDecimal = 0
   private var currentTime = zero
@@ -41,94 +38,99 @@ case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler:
 
       val currentCapital = _capital
 
-      val origSender = sender
-
       m match {
         case Transfer(payment) =>
           require(payment >= 0)
 
-          val newCapital = for {
+          _capital = for {
             c <- currentCapital
-            (newC, _) <- buyAll(c)(payment, t)
+            Transaction(newC, amount, _) <- buyAll(c)(payment, t)
+            _ = if (amount < payment)
+              logger.warn(
+                s"Could not invest everything. Invested $amount out of $payment.")
           } yield newC
 
-          // Reinvestment not fail
-          _capital = newCapital
-
-        case MarginCall(id, payment, maxDelay) =>
-          require(payment >= 0)
+        case MarginCall(rId, payment, maxDelay) =>
+          require(payment >= 0, s"Payment to $name was $payment")
 
           writeToCsv(t, payment)
 
-          val newCapitalAndTimeF = (for {
+          val transaction = for {
             c <- currentCapital
-            (newCap, timeToSell) <- sellAll(c)(payment, t)
-          } yield (newCap, timeToSell)).ensure(s"Not sold on time for $name")(_._2 <= maxDelay)
+            t <- sellAll(c)(payment, t)
+              .ensure(s"Not sold on time for $name.") {
+                case Transaction(_, _, t) => t <= maxDelay
+              }
+          } yield t
 
-          val newCapitalF = newCapitalAndTimeF.map(_._1)
-          val timeToSellF = newCapitalAndTimeF.map(_._2)
+          val newCapitalF = transaction.map(_.portfolio)
+          val timeToSellF = transaction.map(_.timeToPerform)
+          val amountF = transaction.map(_.transactionAmount)
 
           // Fails if not enough was sold or on time, reassign same capital
           _capital = newCapitalF ||| currentCapital
 
-          val response = ((timeToSellF | Timed.zero) |@| (timeToSellF.map(_ => payment) | 0))(
-            (timeToSell, raisedAmount) => {
-              scheduledMessage(t + timeToSell,
-                               origSender,
-                               MarginCallResponse(id, self, raisedAmount))
-            })
+          val timeToSell = timeToSellF | Timed.zero
+          val amount = amountF | BigDecimal(0)
 
-          response pipeTo scheduler
+          scheduleMessage(t + timeToSell,
+                          sender,
+                          MarginCallResponse(rId, self, amount))
 
-        case DefaultFundCall(id, payment, maxDelay) =>
+        case DefaultFundCall(rId, payment, maxDelay) =>
           require(payment >= 0)
 
           writeToCsv(t, payment)
 
-          val newCapitalAndTimeF = (for {
+          val transaction = for {
             c <- currentCapital
-            (newCap, timeToSell) <- sellAll(c)(payment, t)
-          } yield (newCap, timeToSell)).ensure(s"Not sold on time for $name.")(_._2 <= maxDelay)
+            t <- sellAll(c)(payment, t)
+              .ensure(s"Not sold on time for $name.") {
+                case Transaction(_, _, t) => t <= maxDelay
+              }
+          } yield t
 
-          val newCapitalF = newCapitalAndTimeF.map(_._1)
-          val timeToSellF = newCapitalAndTimeF.map(_._2)
+          val newCapitalF = transaction.map(_.portfolio)
+          val timeToSellF = transaction.map(_.timeToPerform)
+          val amountF = transaction.map(_.transactionAmount)
 
           // Fails if not enough was sold or on time, reassign same capital
           _capital = newCapitalF ||| currentCapital
 
-          val response = ((timeToSellF | Timed.zero) |@| (timeToSellF.map(_ => payment) | 0))(
-            (timeToSell, raisedAmount) => {
-              scheduledMessage(t + timeToSell,
-                               origSender,
-                               DefaultFundCallResponse(id, self, raisedAmount))
-            })
+          val timeToSell = timeToSellF | Timed.zero
+          val amount = amountF | BigDecimal(0)
 
-          response pipeTo scheduler
+          scheduleMessage(t + timeToSell,
+                          sender,
+                          DefaultFundCallResponse(rId, self, amount))
 
-        case UnfundedDefaultFundCall(id, waterfallId, payment, maxDelay) =>
+        case UnfundedDefaultFundCall(rId, waterfallId, payment, maxDelay) =>
           require(payment >= 0)
 
           writeToCsv(t, payment)
 
-          val newCapitalAndTimeF = (for {
+          val transaction = for {
             c <- currentCapital
-            (newCap, timeToSell) <- sellAll(c)(payment, t)
-          } yield (newCap, timeToSell)).ensure(s"Not sold on time for $name.")(_._2 <= maxDelay)
+            t <- sellAll(c)(payment, t)
+              .ensure(s"Not sold on time for $name.") {
+                case Transaction(_, _, time) => time <= maxDelay
+              }
+          } yield t
 
-          val newCapitalF = newCapitalAndTimeF.map(_._1)
-          val timeToSellF = newCapitalAndTimeF.map(_._2)
+          val newCapitalF = transaction.map(_.portfolio)
+          val timeToSellF = transaction.map(_.timeToPerform)
+          val amountF = transaction.map(_.transactionAmount)
 
           // Fails if not enough was sold or on time, reassign same capital
           _capital = newCapitalF ||| currentCapital
 
-          val response = ((timeToSellF | Timed.zero) |@| (timeToSellF
-            .map(_ => payment) | 0))((timeToSell, raisedAmount) => {
-            scheduledMessage(t + timeToSell,
-                             origSender,
-                             UnfundedDefaultFundCallResponse(id, waterfallId, self, raisedAmount))
-          })
+          val timeToSell = timeToSellF | Timed.zero
+          val amount = amountF | BigDecimal(0)
 
-          response pipeTo scheduler
+          scheduleMessage(
+            t + timeToSell,
+            sender,
+            UnfundedDefaultFundCallResponse(rId, waterfallId, self, amount))
       }
   }
 
@@ -154,7 +156,7 @@ case class Member(name: String, capital: Portfolio, market: ActorRef, scheduler:
 }
 
 object Member {
-  def props[A](name: String, capital: Portfolio, market: ActorRef, scheduler: ActorRef): Props = {
-    Props(Member(name, capital, market, scheduler))
+  def props[A](name: String, capital: Portfolio, scheduler: ActorRef): Props = {
+    Props(Member(name, capital, scheduler))
   }
 }

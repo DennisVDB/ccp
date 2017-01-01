@@ -2,24 +2,16 @@ package market
 
 import java.io.File
 
-import akka.actor.{Actor, Props}
-import akka.pattern.pipe
 import breeze.linalg.{Axis, DenseVector}
 import breeze.stats.distributions.{Gaussian, MultivariateGaussian}
-import com.github.tototoshi.csv.CSVWriter
 import com.typesafe.scalalogging.Logger
-import market.Market.{Index, Margin, Price}
+import market.Market.Index
 import spire.implicits._
 import spire.math
-import structure.Timed.{Time, res, _}
-import util.DataUtil.ec
+import structure.Timed.{Time, res}
 import util.Result.Result
 
-import scala.concurrent.Future
-//import scala.concurrent.ExecutionContext.Implicits.globalimport scala.concurrent.Future
-import scala.concurrent.duration._
 import scalaz.Scalaz._
-import scalaz._
 
 /**
   * Provides the prices for any point in time.
@@ -32,90 +24,22 @@ case class Market(prices: Map[Security, BigDecimal],
                   indexes: Map[Security, Index],
                   retDistr: MultivariateGaussian,
                   scaling: Int,
-                  data: Option[Map[Time, Map[Security, BigDecimal]]])
-    extends Actor {
+                  data: Map[Time, Map[Security, BigDecimal]]) {
   private val icdf = (p: Double) => BigDecimal(Gaussian(0, 1).icdf(p))
-
-  private var generatedPrices = Map(FiniteDuration(0, res) -> prices)
-
   private val logger = Logger("Market")
-
   private val f = new File("out.csv")
-
-  def receive: Receive = {
-    case Price(i, t) => sender ! price(i, t)
-    case Margin(portfolio, coverage, timeHorizon, t) =>
-      margin(portfolio, coverage, timeHorizon, t).run pipeTo sender
-  }
 
   /**
     * Provide the price for the instrument at the given time.
-    * @param time time for price.
+    * @param t time for price.
     * @param instrument instrument
     * @return the price for the instrument at the given time.
     */
-  private def price(instrument: Security, time: Time): \/[String, BigDecimal] = {
-
-    /**
-      * Helper function for generating prices for a specific point in time.
-      * Will also generate prices for the missing past.
-      * @param t point in time of prices.
-      * @return prices for point in time t.
-      */
-    def generatePrices(t: Time): Option[Map[Security, BigDecimal]] = data match {
-      case Some(d) => d.get(t)
-
-      case None =>
-        val returns = retDistr.draw().map(BigDecimal(_))
-
-        val newPsO = indexes.keys.toList
-          .traverse[Option, (Security, BigDecimal)](security =>
-            for {
-              // If the data does not exist, recursively generate it.
-              ps <- generatedPrices.get(t - tick).orElse(generatePrices(t - tick))
-              p <- ps.get(security)
-              i <- indexes.get(security)
-              r = returns(i)
-            } yield {
-              // Store the generated past data.
-              // Might just overwrite the same if it already existed.
-              generatedPrices += (t - tick) -> ps
-
-              // Price cannot be negative
-              security -> ((p * (1 + (r / scaling))) max 0)
-          })
-          .map(_.toMap)
-
-        // Store the new generated data.
-        newPsO.foreach(newPs => generatedPrices += t -> newPs)
-
-        for {
-          newPs <- newPsO
-        } {
-          Future {
-            val writer = CSVWriter.open(f, append = true)
-            val stringifiedTime = t.toUnit(res).toString
-            val stringifiedPs = newPs.values.map(_.toString)
-            val row = Iterable(stringifiedTime) ++ stringifiedPs
-            writer.writeRow(row.toSeq)
-            writer.close()
-          }
-        }
-
-        newPsO
-    }
-
-    val price = generatedPrices.get(time) match {
-      case Some(ps) =>
-        ps.get(instrument)
-      case None =>
-        for {
-          ps <- generatePrices(time)
-          p <- ps.get(instrument)
-        } yield p
-    }
-
-    price \/> s"Could not get price for $instrument @$time"
+  def price(instrument: Security, t: Time): Result[BigDecimal] = {
+    for {
+      dataAtTime <- data.get(t) \/> s"Could not get data at time $t."
+      price <- dataAtTime.get(instrument) \/> s"Could not get price for $instrument @$t"
+    } yield price
   }
 
   /**
@@ -126,12 +50,10 @@ case class Market(prices: Map[Security, BigDecimal],
     * @param coverage coverage needed.
     * @return Amount of margin needed.
     */
-  private def margin(portfolio: Portfolio,
-                     coverage: BigDecimal,
-                     timeHorizon: Time,
-                     t: Time): Result[BigDecimal] = {
-    logger.debug(s"Computing margin of portfolio $portfolio")
-
+  def margin(portfolio: Portfolio,
+             coverage: BigDecimal,
+             timeHorizon: Time,
+             t: Time): Result[BigDecimal] = {
     // Set of positions in the portfolio.
     val pPositions = portfolio.positions.keys.toSet
 
@@ -201,15 +123,15 @@ case class Market(prices: Map[Security, BigDecimal],
           (pMuHorizon - pSigmaHorizon * zScore) max -1 // Cannot lose more than 100% if long
         else pMuHorizon + pSigmaHorizon * zScore
 
-//        _ = logger.debug(s"$portfolio -> $pMuHorizon +- $pSigmaHorizon * $zScore")
-//        _ = logger.debug(s"$portfolio -> $ret * $price")
+//        _ = logger.debug(s"$pMuHorizon +- $pSigmaHorizon * $zScore")
+//        _ = logger.debug(s"$ret * $price")
 
         valueAtRisk = price * ret
 
         // Only take margin if the value at risk is negative. For instance it could be
         m = -valueAtRisk max 0
 
-//        _ = logger.debug(s"m $m")
+//        _ = logger.debug(s"MARGIN $m")
       } yield m // valueAtRisk is negative, we flip the sign.
     }
   }
@@ -217,14 +139,4 @@ case class Market(prices: Map[Security, BigDecimal],
 
 object Market {
   type Index = Int
-
-  case class Price(security: Security, t: Time)
-  case class Margin(portfolio: Portfolio, coverage: BigDecimal, timeHorizon: Time, t: Time)
-
-  def props(prices: Map[Security, BigDecimal],
-            indexes: Map[Security, Index],
-            retDistr: MultivariateGaussian,
-            scaling: Int,
-            data: Option[Map[Time, Map[Security, BigDecimal]]]): Props =
-    Props(Market(prices, indexes, retDistr, scaling, data))
 }

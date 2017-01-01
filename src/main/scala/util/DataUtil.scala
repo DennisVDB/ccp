@@ -35,12 +35,14 @@ object DataUtil {
     }
   }
 
-  def readCsv(f: String, indexes: Map[Security, Index]): Map[Time, Map[Security, BigDecimal]] = {
+  def readCsv(
+      f: String,
+      indexes: Map[Security, Index]): Map[Time, Map[Security, BigDecimal]] = {
     val reader = CSVReader.open(s"$f.csv")
     val data = reader.all()
     val flippedIndexes = indexes.map(_.swap)
 
-    val foo = data
+    data
       .map(_.splitAt(1))
       .map {
         case (x, xs) =>
@@ -50,20 +52,17 @@ object DataUtil {
       .map {
         case (x, xs) =>
           (x, xs.map {
-            case (i, b) => (flippedIndexes.getOrElse(i, throw new IllegalStateException()), b)
+            case (i, b) =>
+              (flippedIndexes.getOrElse(i, throw new IllegalStateException()),
+               b)
           })
       }
       .toMap
       .mapValues(_.toMap)
-
-    print(foo)
-
-    foo
   }
 
-  implicit val ec = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(1))
-
-
+  implicit val ec =
+    ExecutionContext.fromExecutor(Executors.newFixedThreadPool(1))
   //  def bigDecimalMonoid = new Monoid[BigDecimal] {
 //    def zero: BigDecimal = BigDecimal(0)
 //

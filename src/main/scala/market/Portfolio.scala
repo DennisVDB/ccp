@@ -1,16 +1,10 @@
 package market
 
-import akka.actor.ActorRef
-import akka.pattern.ask
-import akka.util.Timeout
 import com.typesafe.scalalogging.Logger
-import market.Market.{Margin, Price}
 import market.Portfolio.price
 import structure.Timed.{Time, zero}
-import util.DataUtil.ec
-import util.Result
-import util.Result.{Result, resultMonoid}
-//import scala.concurrent.ExecutionContext.Implicits.global
+import util.Result.Result
+
 import scala.concurrent.duration._
 import scala.language.postfixOps
 import scalaz.Scalaz._
@@ -20,8 +14,7 @@ import scalaz._
   * Portfolio of positions.
   * @param positions instruments and their respective amount.
   */
-case class Portfolio(positions: Map[Security, BigDecimal], market: ActorRef) {
-  implicit val timeout: Timeout = 60 seconds
+case class Portfolio(positions: Map[Security, BigDecimal], market: Market) {
   lazy val inverse: Portfolio = Portfolio.inverse(this)
   private val logger = Logger("portfolio")
 
@@ -35,7 +28,7 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: ActorRef) {
       .traverse[Result, (Security, BigDecimal)] {
         case (item, amount) => {
           for {
-            p <- Result((market ? Price(item, t)).mapTo[String \/ BigDecimal])
+            p <- market.price(item, t)
             total <- price(this)(t)
             weight = (p * amount) / total
           } yield item -> weight
@@ -51,9 +44,10 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: ActorRef) {
     * @param timeHorizon time horizon for the value at risk.
     * @return the margin for the given coverage and timeHorizon
     */
-  def margin(t: Time)(coverage: BigDecimal, timeHorizon: Time): Result[BigDecimal] = {
-    if (isEmpty) Result.pure(0)
-    else Result((market ? Margin(this, coverage, timeHorizon, t)).mapTo[String \/ BigDecimal])
+  def margin(t: Time)(coverage: BigDecimal,
+                      timeHorizon: Time): Result[BigDecimal] = {
+    if (isEmpty) \/-(0)
+    else market.margin(this, coverage, timeHorizon, t)
   }
 
   /**
@@ -70,12 +64,12 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: ActorRef) {
   def replacementCost(t: Time): Result[(BigDecimal, Time)] = {
     val costF = positions.toList.map {
       case (item, amount) if amount < 0 =>
-        val price =
-          Result((market ? Price(item, t + closeoutPeriod(amount))).mapTo[String \/ BigDecimal])
+        val price = market.price(item, t + closeoutPeriod(amount))
+
         price.map(-_ * amount)
 
       case (_, amount) if amount >= 0 =>
-        Result.pure(BigDecimal(0))
+        \/-(BigDecimal(0))
     }.suml
 
     val timeToCloseOut = positions.map {
@@ -96,10 +90,8 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: ActorRef) {
 object Portfolio {
   val logger = Logger("portfolio")
 
-  implicit val timeout: Timeout = 60 seconds
-
   type TradeAction =
-    Portfolio => (Security, BigDecimal, Time) => Result[(Portfolio, Time)]
+    Portfolio => (Security, BigDecimal, Time) => Result[Transaction]
 
   def inverse(p: Portfolio): Portfolio =
     p.copy(positions = p.positions map {
@@ -112,84 +104,93 @@ object Portfolio {
     * @return the price of the portfolio at time t.
     */
   def price(p: Portfolio)(t: Time): Result[BigDecimal] = {
-    p.positions.toList
-      .map({
-        case (item, amount) =>
-          for {
-            price <- Result((p.market ? Price(item, t)).mapTo[String \/ BigDecimal])
-          } yield price * amount
-      })
-      .suml
+    p.positions.toList.map {
+      case (item, amount) =>
+        for {
+          price <- p.market.price(item, t)
+        } yield price * amount
+    }.suml
   }
 
   def perform(p: Portfolio)(security: Security, cash: BigDecimal, t: Time)(
       f: (BigDecimal, BigDecimal) => BigDecimal) = {
     for {
-      currentAmount <- Result.fromOption(
-        p.positions.get(security) \/> s"Could not get position for security $security.")
+      currentAmount <- p.positions.get(security) \/> s"Could not get position for security $security."
 
       wasLong = currentAmount >= 0
 
       performTime = t + p.closeoutPeriod(cash)
 
-      price <- Result((p.market ? Market.Price(security, performTime)).mapTo[String \/ BigDecimal])
-      if price != 0
+      price <- p.market
+        .price(security, performTime)
+        .ensure(s"Price is zero of $security.")(_ != 0)
 
-      newAmount = f(currentAmount, cash / price)
+      newAmount = if (wasLong) {
+        f(currentAmount, cash / price) max 0 // Cannot sell more than you have
+      } else {
+        f(currentAmount, cash / price) min 0
+      }
 
-      isLong = newAmount >= 0
-
-      // Did not change from long to short, and inversely
-      if wasLong == isLong
+      raised = ((currentAmount - newAmount) * price).abs
 
       newPortfolio = p.copy(positions = p.positions + (security -> newAmount))
-    } yield (newPortfolio, p.closeoutPeriod(cash))
+    } yield Transaction(newPortfolio, raised, p.closeoutPeriod(cash))
   }
 
   def performAll(p: Portfolio)(cash: BigDecimal, t: Time)(
-      f: TradeAction): Result[(Portfolio, Time)] = {
+      f: TradeAction): Result[Transaction] = {
     val totalPriceF = price(p)(t)
 
     val update = (security: Security) =>
-      (work: Result[(Portfolio, Time)]) =>
+      (work: Result[Transaction]) =>
         for {
-          (p, currentTimeToPerform) <- work
-          price <- Result((p.market ? Price(security, t)).mapTo[String \/ BigDecimal])
-          amount <- Result.fromOption(
-            p.positions.get(security) \/> s"Could not get position for security $security.")
+          Transaction(p, currentRaised, currentTimeToPerform) <- work
+
+          price <- p.market.price(security, t)
+
+          amount <- p.positions.get(security) \/> s"Could not get position for security $security."
 
           totalPrice <- totalPriceF
 
-          (updatedPortfolio, timeToPerform) <- if (totalPrice != 0) {
+          t @ Transaction(updatedPortfolio, raised, timeToPerform) <- if (totalPrice != 0) {
             f(p)(security, cash * ((price * amount) / totalPrice), t)
           } else {
             f(p)(security, cash, t)
           }
-        } yield (updatedPortfolio, currentTimeToPerform max timeToPerform)
+        } yield
+          Transaction(updatedPortfolio,
+                      currentRaised + raised,
+                      currentTimeToPerform max timeToPerform)
 
     val securities = p.positions.keys.toList
 
     val _performAll = for {
-      _ <- securities.traverse[State[Result[(Portfolio, Time)], ?], Unit](
-        State.modify[Result[(Portfolio, Time)]] _ compose update)
-
+      _ <- securities
+        .traverse[State[Result[Transaction], ?], Unit](
+          State.modify[Result[Transaction]] _ compose update)
       s <- State.get
     } yield s
 
-    _performAll.run(Result.pure((p, zero)))._2
+    _performAll.run(\/-(Transaction(p, 0, zero)))._2
   }
 
-  def sell(
-      p: Portfolio)(security: Security, amount: BigDecimal, t: Time): Result[(Portfolio, Time)] =
+  def sell(p: Portfolio)(security: Security,
+                         amount: BigDecimal,
+                         t: Time): Result[Transaction] =
     perform(p)(security, amount, t) { _ - _ }
 
-  def sellAll(p: Portfolio)(cash: BigDecimal, t: Time): Result[(Portfolio, Time)] =
+  def sellAll(p: Portfolio)(cash: BigDecimal, t: Time): Result[Transaction] =
     performAll(p)(cash, t)(sell)
 
-  def buy(
-      p: Portfolio)(security: Security, amount: BigDecimal, t: Time): Result[(Portfolio, Time)] =
+  def buy(p: Portfolio)(security: Security,
+                        amount: BigDecimal,
+                        t: Time): Result[Transaction] =
     perform(p)(security, amount, t) { _ + _ }
 
-  def buyAll(p: Portfolio)(cash: BigDecimal, t: Time): Result[(Portfolio, Time)] =
+  def buyAll(p: Portfolio)(cash: BigDecimal, t: Time): Result[Transaction] =
     performAll(p)(cash, t)(buy)
+
+  case class Transaction(portfolio: Portfolio,
+                         transactionAmount: BigDecimal,
+                         timeToPerform: Time)
 }

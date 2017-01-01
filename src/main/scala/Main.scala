@@ -41,23 +41,22 @@ object Main extends App {
 
   val bla = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3)
 
-  val market = system.actorOf(
-    Market.props(
-      prices = Map(pos1 -> BigDecimal("10000"),
-                   pos2 -> BigDecimal("5000"),
-                   pos3 -> BigDecimal("3000"),
-                   sp500 -> BigDecimal("100")),
-      indexes = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3),
-      retDistr = MultivariateGaussian(
-        DenseVector(-0.5, 0.0, 0.0, 0.0),
-        DenseMatrix((1.0, 0.0, 0.0, 0.0),
-                    (0.0, 1.0, 0.0, 0.0),
-                    (0.0, 0.0, 1.0, 0.0),
-                    (0.0, 0.0, 0.0, 1.0))
-      ),
-      scaling = 100,
-      Some(readCsv("out", bla))
-    ))
+  val market = Market(
+    prices = Map(pos1 -> BigDecimal("10000"),
+                 pos2 -> BigDecimal("5000"),
+                 pos3 -> BigDecimal("3000"),
+                 sp500 -> BigDecimal("100")),
+    indexes = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3),
+    retDistr = MultivariateGaussian(
+      DenseVector(-0.5, 0.0, 0.0, 0.0),
+      DenseMatrix((0.01, 0.0, 0.0, 0.0),
+                  (0.0, 0.01, 0.0, 0.0),
+                  (0.0, 0.0, 0.01, 0.0),
+                  (0.0, 0.0, 0.0, 0.01))
+    ),
+    scaling = 10000,
+    readCsv("out", bla)
+  )
 
   // Some(readCsv("out", Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3)))
 
@@ -74,7 +73,6 @@ object Main extends App {
       Member.props(
         name = "member 1",
         capital = capital,
-        market = market,
         scheduler = scheduler
       )
     )
@@ -84,7 +82,6 @@ object Main extends App {
       Member.props(
         name = "member 2",
         capital = capital,
-        market = market,
         scheduler = scheduler
       )
     )
@@ -94,7 +91,6 @@ object Main extends App {
       Member.props(
         name = "member 3",
         capital = emptyPortfolio,
-        market = market,
         scheduler = scheduler
       )
     )
@@ -104,7 +100,6 @@ object Main extends App {
       Member.props(
         name = "member 4",
         capital = emptyPortfolio,
-        market = market,
         scheduler = scheduler
       )
     )
@@ -163,7 +158,6 @@ object Main extends App {
         coverWithFirstLevelEquity = 15 minutes,
         coverWithSecondLevelEquity = 15 minutes
       ),
-      market = market,
       scheduler = scheduler
     )
   )
@@ -203,7 +197,6 @@ object Main extends App {
         coverWithFirstLevelEquity = 15 minutes,
         coverWithSecondLevelEquity = 15 minutes
       ),
-      market = market,
       scheduler = scheduler
     )
   )
@@ -216,7 +209,7 @@ object Main extends App {
   println(s"member4 as $member4")
 
   val scenario = system.actorOf(
-    Scenario.props(ccps = Set(ccp1), timeHorizon = 2 days, scheduler = scheduler)
+    Scenario.props(ccps = Set(ccp1, ccp2), timeHorizon = 2 days, scheduler = scheduler)
   )
 
   Thread.sleep(2000)

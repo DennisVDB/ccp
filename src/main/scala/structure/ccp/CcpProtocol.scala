@@ -10,6 +10,8 @@ trait CcpProtocol
 
 case class MarginCall(id: RequestId, payment: BigDecimal, maxDelay: Time) extends CcpProtocol
 
+case class LossMarginCall(id: RequestId, payment: BigDecimal, maxDelay: Time) extends CcpProtocol
+
 case class MarginCallResponse(id: RequestId, counterParty: ActorRef, payment: BigDecimal)
     extends CcpProtocol
 
@@ -28,6 +30,8 @@ case class UnfundedDefaultFundCallResponse(id: RequestId, waterfallId: Waterfall
     extends CcpProtocol
 
 case class Transfer(payment: BigDecimal) extends CcpProtocol
+
+case class VMGHLoss(loss: BigDecimal) extends CcpProtocol
 
 case class FailedStage(stage: Waterfall.WaterfallStage) extends CcpProtocol
 

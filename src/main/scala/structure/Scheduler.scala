@@ -1,14 +1,15 @@
 package structure
 
+import akka.Done
 import akka.actor.{Actor, ActorRef, Props}
 import com.typesafe.scalalogging.Logger
+import structure.Scenario.Reset
 import structure.Scheduler.{Release, Run, ScheduledMessage}
 import structure.Timed._
-import util.DataUtil.ec
 
 import scala.collection.mutable
-//import scala.concurrent.ExecutionContext.Implicits.global
-import scala.concurrent.duration._
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration.FiniteDuration
 
 /**
   * Schedules messages so they are sent in the right order.
@@ -30,6 +31,11 @@ case class Scheduler(stepTime: Time) extends Actor {
   private var time: Time = zero
 
   def receive: Receive = {
+    case Reset =>
+      messages clear()
+      time = zero
+      sender ! Done
+
     case Run =>
       // Schedule next message release.
       context.system.scheduler.schedule(stepTime, stepTime)(self ! Release)
@@ -47,6 +53,7 @@ case class Scheduler(stepTime: Time) extends Actor {
     * arrive in the right order.
     */
   def release(): Unit = {
+//    logger.debug(s"$time")
     val toSend =
       messages
         .filterKeys(_ <= time)
@@ -62,6 +69,8 @@ case class Scheduler(stepTime: Time) extends Actor {
       // Register the original sender as the sender, so the scheduler is transparent.
       scheduledMessage.to.tell(scheduledMessage.message, sender)
     })
+
+//    messages -= time
 
     (zero.toUnit(res) to (time.toUnit(res), 1)).foreach(t =>
       messages -= FiniteDuration(t.toLong, res)) // Remove sent messages

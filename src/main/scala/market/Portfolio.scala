@@ -44,10 +44,13 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: Market) {
     * @param timeHorizon time horizon for the value at risk.
     * @return the margin for the given coverage and timeHorizon
     */
-  def margin(t: Time)(coverage: BigDecimal,
-                      timeHorizon: Time): Result[BigDecimal] = {
+  def margin(t: Time)(coverage: BigDecimal): Result[BigDecimal] = {
     if (isEmpty) \/-(0)
-    else market.margin(this, coverage, timeHorizon, t)
+    else
+      for {
+        price <- Portfolio.price(this)(t)
+        margin <- market.margin(this, coverage, closeoutPeriod(price), t)
+      } yield margin
   }
 
   /**
@@ -139,20 +142,22 @@ object Portfolio {
 
   def performAll(p: Portfolio)(cash: BigDecimal, t: Time)(
       f: TradeAction): Result[Transaction] = {
-    val totalPriceF = price(p)(t)
+    val totalPriceF = price(p)(t + p.closeoutPeriod(cash))
 
     val update = (security: Security) =>
       (work: Result[Transaction]) =>
         for {
           Transaction(p, currentRaised, currentTimeToPerform) <- work
 
-          price <- p.market.price(security, t)
+          performTime = t + p.closeoutPeriod(cash)
+
+          price <- p.market.price(security, performTime)
 
           amount <- p.positions.get(security) \/> s"Could not get position for security $security."
 
           totalPrice <- totalPriceF
 
-          t @ Transaction(updatedPortfolio, raised, timeToPerform) <- if (totalPrice != 0) {
+          Transaction(updatedPortfolio, raised, timeToPerform) <- if (totalPrice != 0) {
             f(p)(security, cash * ((price * amount) / totalPrice), t)
           } else {
             f(p)(security, cash, t)
@@ -193,4 +198,12 @@ object Portfolio {
   case class Transaction(portfolio: Portfolio,
                          transactionAmount: BigDecimal,
                          timeToPerform: Time)
+
+  implicit val portfolioSemigroup: Semigroup[Portfolio] =
+    new Semigroup[Portfolio] {
+      def append(f1: Portfolio, f2: => Portfolio): Portfolio = {
+        assert(f1.market == f2.market)
+        Portfolio(f1.positions |+| f2.positions, f1.market)
+      }
+    }
 }

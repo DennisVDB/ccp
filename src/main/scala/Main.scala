@@ -4,7 +4,6 @@ import breeze.linalg.{DenseMatrix, DenseVector}
 import breeze.stats.distributions.MultivariateGaussian
 import com.typesafe.config.ConfigFactory
 import market.{Market, Portfolio, Security}
-import structure.Scenario.Run
 import structure._
 import structure.ccp.Ccp._
 import structure.ccp.Waterfall.{End, Start, _}
@@ -14,6 +13,8 @@ import util.DataUtil.readCsv
 import scala.collection.immutable._
 import scala.concurrent.duration._
 import scala.language.postfixOps
+import scalaz.Scalaz._
+import scalaz._
 
 /**
   * Created by dennis on 8/10/16.
@@ -26,6 +27,9 @@ object Main extends App {
   val pos1 = Security("pos1")
   val pos2 = Security("pos2")
   val pos3 = Security("pos3")
+  val pos4 = Security("pos4")
+  val pos5 = Security("pos5")
+  val pos6 = Security("pos6")
   val sp500 = Security("sp500")
 
 //  val market = system.actorOf(
@@ -39,34 +43,83 @@ object Main extends App {
 //      scaling = 100
 //    ))
 
-  val bla = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3)
+  val indexes = Map(pos1 -> 0,
+                    pos2 -> 1,
+                    pos3 -> 2,
+                    pos4 -> 3,
+                    pos5 -> 4,
+                    pos6 -> 5,
+                    sp500 -> 6)
+
+  val prices = Map(
+    pos1 -> BigDecimal("10000"),
+    pos2 -> BigDecimal("5000"),
+    pos3 -> BigDecimal("3000"),
+    pos4 -> BigDecimal("1500"),
+    pos5 -> BigDecimal("1000"),
+    pos6 -> BigDecimal("1800"),
+    sp500 -> BigDecimal("100")
+  )
 
   val market = Market(
-    prices = Map(pos1 -> BigDecimal("10000"),
-                 pos2 -> BigDecimal("5000"),
-                 pos3 -> BigDecimal("3000"),
-                 sp500 -> BigDecimal("100")),
-    indexes = Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3),
+    prices = prices,
+    indexes = indexes,
     retDistr = MultivariateGaussian(
-      DenseVector(-0.5, 0.0, 0.0, 0.0),
-      DenseMatrix((0.01, 0.0, 0.0, 0.0),
-                  (0.0, 0.01, 0.0, 0.0),
-                  (0.0, 0.0, 0.01, 0.0),
-                  (0.0, 0.0, 0.0, 0.01))
+      DenseVector(-0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+      DenseMatrix(
+        (0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        (0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0),
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1)
+      )
     ),
-    scaling = 10000,
-    readCsv("out", bla)
+    scaling = 1000000,
+    readCsv("out", indexes, prices)
   )
 
   // Some(readCsv("out", Map(pos1 -> 0, pos2 -> 1, pos3 -> 2, sp500 -> 3)))
 
-  val longPortfolio = Portfolio(Map(pos1 -> 1), market)
-  val longPortfolio3 = Portfolio(Map(pos1 -> 1, pos2 -> -30, pos3 -> 100), market)
-  val shortPortfolio = longPortfolio.inverse
+  val longPos1 = Portfolio(Map(pos1 -> 100), market)
+  val longPos2 = Portfolio(Map(pos2 -> 100), market)
+  val longPos3 = Portfolio(Map(pos3 -> 100), market)
+  val longPos4 = Portfolio(Map(pos4 -> 100), market)
+  val longPos5 = Portfolio(Map(pos5 -> 100), market)
+  val longPos6 = Portfolio(Map(pos6 -> 100), market)
+
+  val shortPos1 = Portfolio(Map(pos1 -> -20), market)
+  val shortPos2 = Portfolio(Map(pos2 -> -20), market)
+  val shortPos3 = Portfolio(Map(pos3 -> -20), market)
+  val shortPos4 = Portfolio(Map(pos4 -> -20), market)
+  val shortPos5 = Portfolio(Map(pos5 -> -20), market)
+  val shortPos6 = Portfolio(Map(pos6 -> -20), market)
+
+  val member1Portfolio = longPos1 |+| shortPos2 |+| shortPos3 |+| shortPos4 |+| shortPos5 |+| shortPos6
+  val member2Portfolio = longPos2 |+| shortPos1 |+| shortPos3 |+| shortPos4 |+| shortPos5 |+| shortPos6
+  val member3Portfolio = longPos3 |+| shortPos1 |+| shortPos2 |+| shortPos4 |+| shortPos5 |+| shortPos6
+  val member4Portfolio = longPos4 |+| shortPos1 |+| shortPos2 |+| shortPos3 |+| shortPos5 |+| shortPos6
+  val member5Portfolio = longPos5 |+| shortPos1 |+| shortPos2 |+| shortPos3 |+| shortPos4 |+| shortPos6
+  val member6Portfolio = longPos6 |+| shortPos1 |+| shortPos2 |+| shortPos3 |+| shortPos4 |+| shortPos5
+
+  val ccp1Portfolio = (
+    shortPos4 |+| shortPos5 |+| shortPos6 |+|
+      shortPos4 |+| shortPos5 |+| shortPos6 |+|
+      shortPos4 |+| shortPos5 |+| shortPos6
+  ).inverse
+
+  val ccp2Portfolio = {
+    shortPos1 |+| shortPos2 |+| shortPos3 |+|
+      shortPos1 |+| shortPos2 |+| shortPos3 |+|
+      shortPos1 |+| shortPos2 |+| shortPos3
+  }.inverse
+
   val emptyPortfolio = Portfolio(Map(pos3 -> 0), market)
   val capital = Portfolio(Map(sp500 -> 1), market)
+  val capitalInf = Portfolio(Map(sp500 -> 100000), market)
 
-  val scheduler = system.actorOf(Scheduler.props(15 milliseconds))
+  val scheduler = system.actorOf(Scheduler.props(50 milliseconds))
 
   val member1 =
     system.actorOf(
@@ -90,7 +143,7 @@ object Main extends App {
     system.actorOf(
       Member.props(
         name = "member 3",
-        capital = emptyPortfolio,
+        capital = capitalInf,
         scheduler = scheduler
       )
     )
@@ -99,6 +152,24 @@ object Main extends App {
     system.actorOf(
       Member.props(
         name = "member 4",
+        capital = emptyPortfolio,
+        scheduler = scheduler
+      )
+    )
+
+  val member5 =
+    system.actorOf(
+      Member.props(
+        name = "member 5",
+        capital = emptyPortfolio,
+        scheduler = scheduler
+      )
+    )
+
+  val member6 =
+    system.actorOf(
+      Member.props(
+        name = "member 6",
         capital = emptyPortfolio,
         scheduler = scheduler
       )
@@ -125,14 +196,13 @@ object Main extends App {
       name = "ccp1",
       waterfall = isdaWaterfall,
       memberPortfolios = Map(
-        member1 -> longPortfolio,
-        member3 -> longPortfolio,
-        member4 -> shortPortfolio
+        member1 -> member1Portfolio,
+        member3 -> member2Portfolio,
+        member4 -> member3Portfolio
       ),
-      ccpPortfolios = Map.empty[ActorRef, Portfolio], // Map(ccp2 -> longPortfolio),
+      ccpPortfolios = Map(ccp2 -> ccp2Portfolio),
       capital = capital,
       rules = Rules(
-        callEvery = 1 hour,
         maxCallPeriod = 480 minutes,
         maxRecapPeriod = 7200 minutes,
         minimumTransfer = BigDecimal(0),
@@ -147,16 +217,16 @@ object Main extends App {
         )
       ),
       operationalDelays = OperationalDelays(
-        callHandling = 15 minutes,
-        coverWithMargin = 15 minutes,
-        coverWithFund = 15 minutes,
-        coverWithSurvivorsMargins = 15 minutes,
-        coverWithSurvivorsFunds = 15 minutes,
-        computeSurvivorsUnfunded = 15 minutes,
-        coverWithSurvivorsUnfunded = 15 minutes,
-        coverWithVMGH = 15 minutes,
-        coverWithFirstLevelEquity = 15 minutes,
-        coverWithSecondLevelEquity = 15 minutes
+        callHandling = 0 minutes,
+        coverWithMargin = 0 minutes,
+        coverWithFund = 0 minutes,
+        coverWithSurvivorsMargins = 0 minutes,
+        coverWithSurvivorsFunds = 0 minutes,
+        computeSurvivorsUnfunded = 0 minutes,
+        coverWithSurvivorsUnfunded = 0 minutes,
+        coverWithVMGH = 0 minutes,
+        coverWithFirstLevelEquity = 0 minutes,
+        coverWithSecondLevelEquity = 0 minutes
       ),
       scheduler = scheduler
     )
@@ -166,12 +236,12 @@ object Main extends App {
     Ccp.props[Security](
       name = "ccp2",
       waterfall = arnsdorfWaterfall,
-      memberPortfolios =
-        Map(member1 -> longPortfolio, member3 -> longPortfolio, member4 -> shortPortfolio),
-      ccpPortfolios = Map(ccp2 -> longPortfolio),
+      memberPortfolios = Map(member4 -> member4Portfolio,
+                             member5 -> member5Portfolio,
+                             member6 -> member6Portfolio),
+      ccpPortfolios = Map(ccp1 -> ccp1Portfolio),
       capital = capital,
       rules = Rules(
-        callEvery = 1 hour,
         maxCallPeriod = 480 minutes,
         maxRecapPeriod = 7200 minutes,
         minimumTransfer = BigDecimal(0),
@@ -186,16 +256,16 @@ object Main extends App {
         )
       ),
       operationalDelays = OperationalDelays(
-        callHandling = 15 minutes,
-        coverWithMargin = 15 minutes,
-        coverWithFund = 15 minutes,
-        coverWithSurvivorsMargins = 15 minutes,
-        coverWithSurvivorsFunds = 15 minutes,
-        computeSurvivorsUnfunded = 15 minutes,
-        coverWithSurvivorsUnfunded = 15 minutes,
-        coverWithVMGH = 15 minutes,
-        coverWithFirstLevelEquity = 15 minutes,
-        coverWithSecondLevelEquity = 15 minutes
+        callHandling = 0 minutes,
+        coverWithMargin = 0 minutes,
+        coverWithFund = 0 minutes,
+        coverWithSurvivorsMargins = 0 minutes,
+        coverWithSurvivorsFunds = 0 minutes,
+        computeSurvivorsUnfunded = 0 minutes,
+        coverWithSurvivorsUnfunded = 0 minutes,
+        coverWithVMGH = 0 minutes,
+        coverWithFirstLevelEquity = 0 minutes,
+        coverWithSecondLevelEquity = 0 minutes
       ),
       scheduler = scheduler
     )
@@ -209,38 +279,15 @@ object Main extends App {
   println(s"member4 as $member4")
 
   val scenario = system.actorOf(
-    Scenario.props(ccps = Set(ccp1, ccp2), timeHorizon = 2 days, scheduler = scheduler)
+    Scenario.props(ccps = Set(ccp1, ccp2),
+                   members = Set(member1, member2, member3, member4, member5, member6),
+                   timeHorizon = 2 day,
+                   callEvery = 15 minutes,
+      10,
+                   scheduler = scheduler)
   )
 
   Thread.sleep(2000)
 
-  scenario.tell(Run, null)
-
-//  Thread.sleep(10)
-//
-//  // Request paid
-//  val member1PaidF: Future[BigDecimal] = ask(member1, Paid).mapTo[BigDecimal]
-//  val member2PaidF: Future[BigDecimal] = ask(member2, Paid).mapTo[BigDecimal]
-//  val member3PaidF: Future[BigDecimal] = ask(member3, Paid).mapTo[BigDecimal]
-//  val member4PaidF: Future[BigDecimal] = ask(member4, Paid).mapTo[BigDecimal]
-//  val ccp1PaidF: Future[BigDecimal] = ask(ccp1, Paid).mapTo[BigDecimal]
-////  val ccp2PaidF: Future[BigDecimal] = ask(ccp2, Paid).mapTo[BigDecimal]
-//
-//  for {
-//    member1Paid <- member1PaidF
-//    member2Paid <- member2PaidF
-//    member3Paid <- member3PaidF
-//    member4Paid <- member4PaidF
-//    ccp1Paid <- ccp1PaidF
-////    ccp2Paid <- ccp2PaidF
-//  } yield {
-//    println(s"""Member 1 paid: ${member1Paid.toDouble}
-//             |Member 2 paid: ${member2Paid.toDouble}
-//             |Member 3 paid: ${member3Paid.toDouble}
-//             |Member 4 paid: ${member4Paid.toDouble}
-//             |CCP 1 paid: ${ccp1Paid.toDouble}
-//           """.stripMargin)
-//  }
+  scenario.tell(Scenario.Run, null)
 }
-
-//CCP 2 paid: ${ccp2Paid.toDouble}

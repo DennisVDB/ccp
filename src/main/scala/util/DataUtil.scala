@@ -1,16 +1,14 @@
 package util
 
-import java.util.concurrent.Executors
-
-import com.github.tototoshi.csv.CSVReader
+import com.github.tototoshi.csv.{CSVReader, CSVWriter}
 import market.Market.Index
 import market.Security
 import structure.Timed
 import structure.Timed.Time
 
-//import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.Future
 import scala.concurrent.duration.FiniteDuration
-import scala.concurrent.{ExecutionContext, Future}
 
 /**
   * Created by dennis on 12/10/16.
@@ -35,14 +33,15 @@ object DataUtil {
     }
   }
 
-  def readCsv(
-      f: String,
-      indexes: Map[Security, Index]): Map[Time, Map[Security, BigDecimal]] = {
+  def readCsv(f: String,
+              indexes: Map[Security, Index],
+              prices: Map[Security, BigDecimal])
+    : Map[Time, Map[Security, BigDecimal]] = {
     val reader = CSVReader.open(s"$f.csv")
     val data = reader.all()
     val flippedIndexes = indexes.map(_.swap)
 
-    data
+    val rs = data
       .map(_.splitAt(1))
       .map {
         case (x, xs) =>
@@ -59,32 +58,24 @@ object DataUtil {
       }
       .toMap
       .mapValues(_.toMap)
+
+    val ps = rs.mapValues(_.map {
+      case (s, r) =>
+        s -> r * prices.getOrElse(s, throw new IllegalStateException())
+    })
+
+    ps + (Timed.zero -> prices)
   }
 
-  implicit val ec =
-    ExecutionContext.fromExecutor(Executors.newFixedThreadPool(1))
-  //  def bigDecimalMonoid = new Monoid[BigDecimal] {
-//    def zero: BigDecimal = BigDecimal(0)
-//
-//    def append(f1: BigDecimal, f2: => BigDecimal): BigDecimal = f1 + f2
-//  }
+  def writeToCsv(filename: String)(
+      data: Map[String, Map[Int, BigDecimal]]): Unit = {
+    val w = CSVWriter open s"$filename.csv"
 
-//  // From https://gist.github.com/flightonary/404a94791594d7f568f1, changed from Java -> Scala
-//  def sqrt(a: BigDecimal, scale: Int): BigDecimal = {
-//    var x = BigDecimal(Math.sqrt(a.doubleValue()))
-//
-//    if (scale < 17) {
-//      return x
-//    }
-//
-//    var tempScale = 16
-//    while (tempScale < scale) {
-//      //x = x - (x * x - a) / (2 * x);
-//
-//      x = x - (x * x - a) / (2 * x)
-//      tempScale *= 2
-//    }
-//
-//    x
-//  }
+    for {
+      (name, simulations) <- data
+      orderedMovements = simulations.toList.sortBy(_._1).map(_._2)
+    } yield w writeRow name :: orderedMovements
+
+    w close ()
+  }
 }

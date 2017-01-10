@@ -1,10 +1,9 @@
 package structure
 
-import akka.Done
 import akka.actor.{Actor, ActorRef, Props}
 import com.typesafe.scalalogging.Logger
-import structure.Scenario.Reset
-import structure.Scheduler.{Release, Run, ScheduledMessage}
+import structure.Scenario.Done
+import structure.Scheduler.{Release, Run, ScheduledMessage, Setup}
 import structure.Timed._
 
 import scala.collection.mutable
@@ -31,9 +30,15 @@ case class Scheduler(stepTime: Time) extends Actor {
   private var time: Time = zero
 
   def receive: Receive = {
-    case Reset =>
-      messages clear()
+    case Setup(sendTo, ms: List[ScheduledMessage]) =>
+      messages.clear()
       time = zero
+
+      ms.foreach {
+        case m @ ScheduledMessage(_, TimedMessage(t, _)) =>
+          messages.addBinding(t, sender -> m)
+      }
+
       sender ! Done
 
     case Run =>
@@ -80,8 +85,8 @@ case class Scheduler(stepTime: Time) extends Actor {
 }
 
 object Scheduler {
+  case class Setup(sendTo: ActorRef, ms: List[ScheduledMessage])
   case object Run
-  case object TriggerMarginCalls
   case object Release
   case class ScheduledMessage(to: ActorRef, message: TimedMessage)
 
@@ -92,7 +97,9 @@ object Scheduler {
     * @param message message.
     * @return the message wrapped in a scheduled message.
     */
-  def scheduledMessage(time: Time, to: ActorRef, message: Any): ScheduledMessage =
+  def scheduledMessage(time: Time,
+                       to: ActorRef,
+                       message: Any): ScheduledMessage =
     ScheduledMessage(to, TimedMessage(time, message))
 
   def props(stepTime: FiniteDuration): Props = Props(Scheduler(stepTime))

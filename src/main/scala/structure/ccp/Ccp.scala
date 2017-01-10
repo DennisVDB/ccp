@@ -2,19 +2,20 @@ package structure.ccp
 
 import java.util.UUID
 
-import akka.Done
 import akka.actor.{Actor, ActorRef, Props}
 import com.typesafe.scalalogging.Logger
 import market.Portfolio
 import market.Portfolio.{price, sellAll}
-import structure.Scenario.Reset
-import structure.Scheduler.{TriggerMarginCalls, scheduledMessage}
+import structure.Scenario.Done
+import structure.Scheduler.scheduledMessage
 import structure.Timed._
 import structure._
 import structure.ccp.Ccp._
 import structure.ccp.Waterfall.{Failed, _}
 import util.Result
 import util.Result.{Result, flatten}
+
+import scala.util.Try
 //import scala.concurrent.ExecutionContext.Implicits.global
 import scala.language.postfixOps
 import scalaz.Scalaz._
@@ -32,59 +33,83 @@ import scalaz._
 class Ccp(
     _name: String,
     waterfall: Waterfall,
-    memberPortfolios: Map[ActorRef, Portfolio],
-    ccpPortfolios: => Map[ActorRef, Portfolio],
+//    memberPortfolios: Map[ActorRef, Portfolio],
+//    ccpPortfolios: => Map[ActorRef, Portfolio],
     capital: Portfolio,
     rules: Rules,
     delays: OperationalDelays,
-    _scheduler: ActorRef
+    _scheduler: ActorRef,
+    _shouldDefault: Boolean
 ) extends Actor
     with MemberProcess {
-  val name: String = _name
-  val scheduler: ActorRef = _scheduler
-  var _capital: Result[Portfolio] = Result.pure(capital)
-  val logger: Logger = Logger(name)
+  var memberPortfolios = Map.empty[ActorRef, Portfolio]
+  var ccpPortfolios = Map.empty[ActorRef, Portfolio]
   var currentTime: Time = zero
 
+  val name: String = _name
+  val logger: Logger = Logger(name)
+  val scheduler: ActorRef = _scheduler
+  var _capital: Result[Portfolio] = Result.pure(capital)
+  var movements: Map[Time, BigDecimal] = Map.empty
+  val shouldDefault: Boolean = _shouldDefault
+
   def receive: Receive = {
-    case Reset =>
-      _capital = Result.pure(capital)
-      movements = Map.empty
+    case Setup(_memberPortfolios, _ccpPortfolios) =>
+      logger.debug(s"${_ccpPortfolios.values.map(_.positions)}")
+      logger.debug(s"${_memberPortfolios.values.map(_.positions)}")
       currentTime = zero
       previousCallTime = zero
+      _capital = Result.pure(capital)
+      movements = Map.empty
+
+      memberPortfolios = _memberPortfolios
+      ccpPortfolios = _ccpPortfolios
+
+      members = memberPortfolios.keys.toSet
+      ccps = ccpPortfolios.keys.toSet
 
       defaultedMembers = Set.empty
-
-      margins = initialMargins
-      defaultFunds = initDefaultFunds
-      unfundedFundsLeft =
-        allMembers.map(_ -> Result.pure(rules.maximumFundCall)).toMap
-
-      paymentsDue = Map.empty
       haircutsInProgress = 0
-
+      paymentsDue = allMembers.map(_ -> BigDecimal(0)).toMap
       expectedPayments = Map.empty
       expectedUnfundedFunds = Map.empty
 
-      sender ! Done
+      margins = {
+        if (rules.ccpRules.participatesInMargin) {
+          for {
+            (member, portfolio) <- allPortfolios
+          } yield {
+            member -> portfolio.margin(zero)(rules.marginCoverage)
+          }
+        } else {
+          for {
+            (member, portfolio) <- memberPortfolios
+          } yield {
+            member -> portfolio.margin(zero)(rules.marginCoverage)
+          }
+        }
+      }
 
-//    case Setup(timeHorizon: Time) =>
-//      /**
-//        * Recursively schedules margin calls from time t up to the time horizon.
-//        *
-//        * @param t start scheduling at from this time.
-//        */
-//      @tailrec
-//      def scheduleMarginCalls(t: Time): Unit = {
-//        if (t <= timeHorizon) {
-//          scheduleMessage(t, self, TriggerMarginCalls)
-//
-//          // Schedule next
-//          scheduleMarginCalls(t + rules.callEvery)
-//        }
-//      }
-//
-//      scheduleMarginCalls(zero)
+      initialMargins = margins
+
+      defaultFunds = {
+        def fundContribution(m: ActorRef) = {
+          val funds = for {
+            im <- flatten(initialMargins.get(m) \/> s"Could not get IM of $m")
+          } yield im * rules.fundParticipation
+
+          m -> funds
+        }
+
+        allMembers.map(fundContribution).toMap
+      }
+
+      initDefaultFunds = defaultFunds
+
+      unfundedFundsLeft =
+        allMembers.map(_ -> Result.pure(rules.maximumFundCall)).toMap
+
+      sender ! Done
 
     case TriggerDefault(member, paymentLeft, t) =>
       triggerDefault(member, paymentLeft, t)
@@ -161,17 +186,16 @@ class Ccp(
 //  private var _capital = Result.pure(capital)
 //  private var movements = Map.empty[Time, BigDecimal]
 
-  private val members: Set[ActorRef] = memberPortfolios.keys.toSet
-  private val ccps: Set[ActorRef] = ccpPortfolios.keys.toSet
-  private val allMembers: Set[ActorRef] = members ++ ccps
+  private var members: Set[ActorRef] = Set.empty
+  private var ccps: Set[ActorRef] = Set.empty
+  private def allMembers: Set[ActorRef] = members ++ ccps
 
-  private val allPortfolios: Map[ActorRef, Portfolio] = memberPortfolios ++ ccpPortfolios
+  private def allPortfolios: Map[ActorRef, Portfolio] =
+    memberPortfolios ++ ccpPortfolios
 
   private var defaultedMembers: Set[ActorRef] = Set.empty
 
-  private var paymentsDue: Map[ActorRef, BigDecimal] =
-    allMembers.map(_ -> BigDecimal(0)).toMap
-
+  private var paymentsDue: Map[ActorRef, BigDecimal] = Map.empty
   private val vmgh = waterfall.stages.contains(VMGH)
   private var haircutsInProgress = 0
   private def shouldHoldPayments = vmgh && haircutsInProgress > 0
@@ -191,53 +215,27 @@ class Ccp(
   /**
     * Posted margins of members.
     */
-  private var margins: Map[ActorRef, Result[BigDecimal]] = {
-    if (rules.ccpRules.participatesInMargin) {
-      for {
-        (member, portfolio) <- allPortfolios
-      } yield {
-        member -> portfolio.margin(zero)(rules.marginCoverage)
-      }
-    } else {
-      for {
-        (member, portfolio) <- memberPortfolios
-      } yield {
-        member -> portfolio.margin(zero)(rules.marginCoverage)
-      }
-    }
-  }
+  private var margins: Map[ActorRef, Result[BigDecimal]] = Map.empty
 
   /**
     * Snapshot of the initial margins when setting up the CCP.
     */
-  private val initialMargins: Map[ActorRef, Result[BigDecimal]] = margins
+  private var initialMargins: Map[ActorRef, Result[BigDecimal]] = Map.empty
 
   /**
     * Posted default funds of members.
     */
-  private var defaultFunds: Map[ActorRef, Result[BigDecimal]] = {
-    def fundContribution(m: ActorRef) = {
-      val funds = for {
-        im <- flatten(initialMargins.get(m) \/> s"Could not get IM of $m")
-      } yield im * rules.fundParticipation
-
-      m -> funds
-    }
-
-    allMembers.map(fundContribution).toMap
-  }
+  private var defaultFunds: Map[ActorRef, Result[BigDecimal]] = Map.empty
 
   /**
     * Snapshot of the default funds when setting up the CCP.
     */
-  private val initDefaultFunds: Map[ActorRef, Result[BigDecimal]] =
-    defaultFunds
+  private var initDefaultFunds: Map[ActorRef, Result[BigDecimal]] = Map.empty
 
   /**
     * How much unfunded funds can still be called upon.
     */
-  private var unfundedFundsLeft: Map[ActorRef, Result[BigDecimal]] =
-    allMembers.map(_ -> Result.pure(rules.maximumFundCall)).toMap
+  private var unfundedFundsLeft: Map[ActorRef, Result[BigDecimal]] = Map.empty
 
   /**
     * Computes the percentage of the initial default funds of the member ex defaulted members.
@@ -257,8 +255,8 @@ class Ccp(
     for {
       part <- flatten(
         initDefaultFunds.get(member) \/> s"Could not get IDF from $member.")
-      totalFunds <- totalFundsF.ensure("Zero total funds.")(_ != 0)
-    } yield part / totalFunds
+      totalFunds <- totalFundsF
+    } yield Try(part / totalFunds).getOrElse(BigDecimal(0))
   }
 
   /**
@@ -281,8 +279,8 @@ class Ccp(
     for {
       margin <- flatten(
         initialMargins.get(member) \/> s"Could not get IM from $member.")
-      totalMargins <- totalMarginsF.ensure("Zero total margins.")(_ != 0)
-    } yield (margin max 0) / totalMargins
+      totalMargins <- totalMarginsF
+    } yield Try((margin max 0) / totalMargins).getOrElse(BigDecimal(0))
   }
 
   /**
@@ -500,7 +498,10 @@ class Ccp(
         (replacementCost, timeToReplace) <- portfolio.replacementCost(t)
       } yield
         (FinishedStage(Start, member, loss, t),
-         FinishedStage(Start, member, replacementCost, t + timeToReplace))
+         FinishedStage(Start,
+                       member,
+                       replacementCost max 0,
+                       t + timeToReplace))
 
       // Margin payments are not paid during waterfalls if VMGH is used.
       haircutsInProgress += 2
@@ -857,7 +858,7 @@ class Ccp(
 
     val delayedT = t + delays.coverWithSurvivorsUnfunded
 
-    self ! FinishedStage(Unfunded, defaultedMember, lossLeft, delayedT)
+    self ! FinishedStage(Unfunded, defaultedMember, lossLeft max 0, delayedT)
   }
 
   private def coverWithVMGH(defaultedMember: ActorRef,
@@ -1070,22 +1071,24 @@ class Ccp(
 object Ccp {
   def props[A](name: String,
                waterfall: Waterfall,
-               memberPortfolios: Map[ActorRef, Portfolio],
-               ccpPortfolios: => Map[ActorRef, Portfolio],
                capital: Portfolio,
                rules: Rules,
                operationalDelays: OperationalDelays,
-               scheduler: ActorRef): Props = {
+               scheduler: ActorRef,
+               shouldDefault: Boolean = false): Props = {
     Props(
       new Ccp(name,
               waterfall,
-              memberPortfolios,
-              ccpPortfolios,
               capital,
               rules,
               operationalDelays,
-              scheduler))
+              scheduler,
+              shouldDefault))
   }
+
+  case class Setup(memberPortfolios: Map[ActorRef, Portfolio],
+                   ccpPortfolios: Map[ActorRef, Portfolio])
+  case object TriggerMarginCalls
 
   /**
     * Rules of the CCP.
@@ -1101,7 +1104,6 @@ object Ccp {
                    maximumFundCall: BigDecimal,
                    skinInTheGame: BigDecimal,
                    marginCoverage: BigDecimal,
-                   timeHorizon: Time,
                    fundParticipation: BigDecimal,
                    ccpRules: CcpRules) {
     require(maximumFundCall >= 0)

@@ -2,22 +2,21 @@ package structure
 
 import java.util.concurrent.TimeUnit
 
-import akka.Done
 import akka.actor.{Actor, ActorRef, Props}
 import akka.event.LoggingReceive
-import akka.pattern.ask
 import akka.util.Timeout
 import com.typesafe.scalalogging.Logger
+import market.Portfolio
 import structure.Scenario._
-import structure.Scheduler.{Run, TriggerMarginCalls, scheduledMessage}
+import structure.Scheduler.{ScheduledMessage, scheduledMessage}
 import structure.Timed.Time
-import util.DataUtil.writeToCsv
+import structure.ccp.Ccp
+import structure.ccp.Ccp.TriggerMarginCalls
+import util.DataUtil.{Portfolios, writeToCsv}
 
 import scala.annotation.tailrec
-import scala.concurrent.ExecutionContext.Implicits.global
+import scala.collection.immutable.List
 import scala.concurrent.duration.{FiniteDuration, _}
-import scalaz.Scalaz._
-import scalaz._
 
 /**
   * Creates a scenario in which clearinghouses and their members can run until the timeHorizon.
@@ -27,29 +26,51 @@ import scalaz._
   */
 case class Scenario(ccps: Set[ActorRef],
                     members: Set[ActorRef],
+                    ccpMembers: Map[ActorRef, Set[ActorRef]],
+                    ccpLinks: Map[ActorRef, Set[ActorRef]],
                     timeHorizon: Time,
                     callEvery: Time,
                     runs: Int,
+                    portfolios: Portfolios,
                     scheduler: ActorRef)
     extends Actor {
   var movements = Map.empty[String, Map[Int, BigDecimal]]
 
   var runsLeft = runs
   var waitingFor = ccps.size + members.size
+  var waitForSetup = members.size + ccps.size + 1
 
   val logger = Logger("Scenario")
 
   implicit val timeout = Timeout(60 seconds)
 
   override def receive: Receive = LoggingReceive {
-    case Scenario.Run =>
-      ccps.foreach(scheduleMarginCalls(_)(callEvery)(callEvery))
+    case Run =>
+      val marginCalls =
+        ccps.toList.flatMap(scheduledMarginCalls(_)(callEvery)(callEvery))
 
-      val all = ccps ++ members
+      val all = (ccps ++ members).toList
       val t = timeHorizon + FiniteDuration(2, TimeUnit.HOURS)
-      all.foreach(scheduleMessage(t, _, SendData))
+      val sendData = all.map(scheduledMessage(t, _, SendData))
 
-      scheduler ! Run
+      val genPortfolios = portfolios
+
+      val memberPortfolios = memberPortfoliosFrom(genPortfolios.members) _
+      val ccpPortfolios = ccpPortfoliosFrom(genPortfolios.ccps) _
+
+      members.foreach(_ ! Member.Setup)
+
+      ccps.foreach { ccp =>
+        ccp ! Ccp.Setup(memberPortfolios(ccp), ccpPortfolios(ccp))
+      }
+
+      scheduler ! Scheduler.Setup(self, marginCalls ::: sendData)
+
+      waitForSetup = members.size + ccps.size + 1
+
+    case Done =>
+      waitForSetup -= 1
+      if (waitForSetup == 0) scheduler ! Scheduler.Run
 
     case Movements(name, m) =>
       logger.debug(s"RECEIVED $m")
@@ -69,58 +90,71 @@ case class Scenario(ccps: Set[ActorRef],
           logger.debug(s"NEXT RUN")
           waitingFor = (ccps ++ members).size
 
-          val all = (ccps ++ members) + scheduler
-          val wait = all.toList.map(x => (x ? Reset).mapTo[Done]).sequence
-
-          for {
-            _ <- wait
-          } yield self ! Scenario.Run
+          self ! Scenario.Run
         }
       }
 
     case WriteData => writeToCsv("data")(movements)
   }
 
-  /**
-    * Sends the message to the scheduler.
-    * @param time time to deliver the message.
-    * @param to recipient of the message.
-    * @param message the message.
-    */
-  private def scheduleMessage(time: Time, to: ActorRef, message: Any) =
-    scheduler ! scheduledMessage(time, to, message)
+  private def scheduledMarginCalls(receiver: ActorRef)(callEvery: Time)(
+      startAt: Time): List[ScheduledMessage] = {
 
-  /**
-    * Recursively schedules margin calls from time t up to the time horizon.
-    *
-    * @param t start scheduling at from this time.
-    */
-  @tailrec
-  private def scheduleMarginCalls(receiver: ActorRef)(callEvery: Time)(
-      callAt: Time): Unit = {
-    if (callAt <= timeHorizon) {
-      scheduleMessage(callAt, receiver, TriggerMarginCalls)
-
-      // Schedule next
-      scheduleMarginCalls(receiver)(callEvery)(callAt + callEvery)
+    @tailrec
+    def go(callAt: Time, acc: List[ScheduledMessage]): List[ScheduledMessage] = {
+      if (callAt > timeHorizon) acc
+      else
+        go(callAt + callEvery,
+           scheduledMessage(callAt, receiver, TriggerMarginCalls) :: acc)
     }
+
+    go(startAt, List.empty)
+  }
+
+  private def memberPortfoliosFrom(
+      generatedPortfolios: Map[ActorRef, Portfolio])(
+      ccp: ActorRef): Map[ActorRef, Portfolio] = {
+    val members = ccpMembers.getOrElse(ccp, throw new IllegalStateException())
+    (for {
+      m <- members
+      portfolio = generatedPortfolios.getOrElse(
+        m,
+        throw new IllegalStateException)
+    } yield m -> portfolio).toMap
+  }
+
+  private def ccpPortfoliosFrom(
+      generatedPortfolios: Map[ActorRef, Map[ActorRef, Portfolio]])(
+      ccp: ActorRef): Map[ActorRef, Portfolio] = {
+    generatedPortfolios.getOrElse(ccp, throw new IllegalStateException())
   }
 }
 
 object Scenario {
   def props[A](ccps: Set[ActorRef],
                members: Set[ActorRef],
+               ccpMembers: Map[ActorRef, Set[ActorRef]],
+               ccpLinks: Map[ActorRef, Set[ActorRef]],
                timeHorizon: Time,
                callEvery: Time,
                runs: Int,
+               portfolios: Portfolios,
                scheduler: ActorRef): Props = {
-    Props(Scenario(ccps, members, timeHorizon, callEvery, runs, scheduler))
+    Props(
+      Scenario(ccps,
+               members,
+               ccpMembers,
+               ccpLinks,
+               timeHorizon,
+               callEvery,
+               runs,
+               portfolios,
+               scheduler))
   }
 
   case object Run
-  case class Setup(timeHorizon: Time)
+  case object Done
   case class Ready(s: String)
-  case object Reset
   case class Movements(name: String, movements: Map[Time, BigDecimal])
   case object SendData
   case object WriteData

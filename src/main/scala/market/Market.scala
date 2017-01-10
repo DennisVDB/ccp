@@ -23,7 +23,7 @@ import scalaz.Scalaz._
 case class Market(prices: Map[Security, BigDecimal],
                   indexes: Map[Security, Index],
                   retDistr: MultivariateGaussian,
-                  scaling: Int,
+                  scaling: BigDecimal,
                   data: Map[Time, Map[Security, BigDecimal]]) {
   private val icdf = (p: Double) => BigDecimal(Gaussian(0, 1).icdf(p))
   private val logger = Logger("Market")
@@ -131,7 +131,7 @@ case class Market(prices: Map[Security, BigDecimal],
         // Only take margin if the value at risk is negative. For instance it could be
         m = -valueAtRisk max 0
 
-//        _ = logger.debug(s"MARGIN $m")
+        _ = logger.debug(s"MARGIN $m")
       } yield m // valueAtRisk is negative, we flip the sign.
     }
   }

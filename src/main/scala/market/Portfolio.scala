@@ -7,6 +7,7 @@ import util.Result.Result
 
 import scala.concurrent.duration._
 import scala.language.postfixOps
+import scala.util.Try
 import scalaz.Scalaz._
 import scalaz._
 
@@ -14,7 +15,7 @@ import scalaz._
   * Portfolio of positions.
   * @param positions instruments and their respective amount.
   */
-case class Portfolio(positions: Map[Security, BigDecimal], market: Market) {
+case class Portfolio(positions: Map[Security, BigDecimal], market: Market, splitOver: Int = 1) {
   lazy val inverse: Portfolio = Portfolio.inverse(this)
   private val logger = Logger("portfolio")
 
@@ -30,7 +31,7 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: Market) {
           for {
             p <- market.price(item, t)
             total <- price(this)(t)
-            weight = (p * amount) / total
+            weight = Try((p * amount) / total).getOrElse(BigDecimal(1))
           } yield item -> weight
         }
       }
@@ -41,7 +42,6 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: Market) {
     * Margin for the given coverage and timeHorizon.
     * @param t time
     * @param coverage value at risk.
-    * @param timeHorizon time horizon for the value at risk.
     * @return the margin for the given coverage and timeHorizon
     */
   def margin(t: Time)(coverage: BigDecimal): Result[BigDecimal] = {
@@ -67,16 +67,17 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: Market) {
   def replacementCost(t: Time): Result[(BigDecimal, Time)] = {
     val costF = positions.toList.map {
       case (item, amount) if amount < 0 =>
-        val price = market.price(item, t + closeoutPeriod(amount))
-
-        price.map(-_ * amount)
+        for {
+          currentPrice <- market.price(item, t)
+          price <- market.price(item, t + closeoutPeriod(amount * splitOver))
+        } yield (price - currentPrice) * amount
 
       case (_, amount) if amount >= 0 =>
         \/-(BigDecimal(0))
     }.suml
 
     val timeToCloseOut = positions.map {
-      case (_, amount) if amount < 0 => closeoutPeriod(amount)
+      case (_, amount) if amount < 0 => closeoutPeriod(amount * splitOver)
       case _ => zero
     }.max
 
@@ -88,6 +89,11 @@ case class Portfolio(positions: Map[Security, BigDecimal], market: Market) {
   val isEmpty: Boolean = positions.isEmpty
 
   def isShort(t: Time): Result[Boolean] = price(this)(t).map(_ > 0)
+
+  def / (n: Int): Portfolio = {
+    val newPos = positions.mapValues(_ / n)
+    copy(positions = newPos)
+  }
 }
 
 object Portfolio {
@@ -206,4 +212,13 @@ object Portfolio {
         Portfolio(f1.positions |+| f2.positions, f1.market)
       }
     }
+
+//  implicit val portfolioMonoid: Monoid[Portfolio] = new Monoid[Portfolio] {
+//    def zero: Portfolio = Portfolio()
+//
+//    def append(f1: Portfolio, f2: => Portfolio): Portfolio = {
+//      assert(f1.market == f2.market)
+//      Portfolio(f1.positions |+| f2.positions, f1.market)
+//    }
+//  }
 }

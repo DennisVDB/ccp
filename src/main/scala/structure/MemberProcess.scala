@@ -17,26 +17,23 @@ import scalaz.Scalaz._
   */
 trait MemberProcess extends Actor {
   val name: String
-  var _capital: Result[Portfolio]
   val scheduler: ActorRef
   val logger: Logger
+  val shouldDefault: Boolean
 
-  var movements: Map[Time, BigDecimal] = Map.empty
+  var movements: Map[Time, BigDecimal]
+  var _capital: Result[Portfolio]
 
   def handleMemberTimedMessages(t: Time): Receive = {
-    case SendData => sender ! Movements(name, movements)
+    case SendData =>
+      sender ! Movements(name, movements)
 
     case Transfer(payment) =>
       if (payment < 0) logger.warn(s"Payment is $payment.")
 
-//      movements |+|= Map(t -> payment)
-
       _capital = for {
         c <- _capital
         Transaction(newC, _, _) <- buyAll(c)(payment max 0, t)
-//        _ = if (amount < payment)
-//          logger.warn(
-//            s"Could not invest everything. Invested $amount out of $payment.")
       } yield newC
 
     case MarginCall(rId, payment, maxDelay) =>
@@ -51,8 +48,79 @@ trait MemberProcess extends Actor {
     case DefaultFundCall(rId, payment, maxDelay) =>
       require(payment >= 0)
 
-      movements |+|= Map(t -> payment)
+      if (shouldDefault) {
+        scheduleMessage(t, sender, DefaultFundCallResponse(rId, self, 0))
+      } else {
+        val transaction = for {
+          c <- _capital
+          t <- sellAll(c)(payment, t)
+            .ensure(s"Not sold on time for $name.") {
+              case Transaction(_, _, t) => t <= maxDelay
+            }
+        } yield t
 
+        val newCapitalF = transaction.map(_.portfolio)
+        val timeToSellF = transaction.map(_.timeToPerform)
+        val amountF = transaction.map(_.transactionAmount)
+
+        // Fails if not enough was sold or on time, reassign same capital
+        _capital = newCapitalF ||| _capital
+
+        val timeToSell = timeToSellF | Timed.zero
+        val amount = amountF | BigDecimal(0)
+
+        movements |+|= Map((t + timeToSell) -> amount)
+
+        scheduleMessage(t + timeToSell,
+                        sender,
+                        DefaultFundCallResponse(rId, self, amount))
+      }
+
+    case UnfundedDefaultFundCall(rId, waterfallId, payment, maxDelay) =>
+      require(payment >= 0)
+
+      if (shouldDefault) {
+        scheduleMessage(
+          t,
+          sender,
+          UnfundedDefaultFundCallResponse(rId, waterfallId, self, 0))
+      } else {
+        val transaction = for {
+          c <- _capital
+          t <- sellAll(c)(payment, t)
+            .ensure(s"Not sold on time for $name.") {
+              case Transaction(_, _, time) => time <= maxDelay
+            }
+        } yield t
+
+        val newCapitalF = transaction.map(_.portfolio)
+        val timeToSellF = transaction.map(_.timeToPerform)
+        val amountF = transaction.map(_.transactionAmount)
+
+        // Fails if not enough was sold or on time, reassign same capital
+        _capital = newCapitalF ||| _capital
+
+        val timeToSell = timeToSellF | Timed.zero
+        val amount = amountF | BigDecimal(0)
+
+        movements |+|= Map((t + timeToSell) -> amount)
+
+        scheduleMessage(
+          t + timeToSell,
+          sender,
+          UnfundedDefaultFundCallResponse(rId, waterfallId, self, amount))
+      }
+
+    case VMGHLoss(loss) => movements |+|= Map(t -> loss)
+  }
+
+  private def handleMarginCall(rId: RequestId,
+                               payment: BigDecimal,
+                               maxDelay: Time,
+                               t: Time) = {
+    if (shouldDefault) {
+      scheduleMessage(t, sender, MarginCallResponse(rId, self, 0))
+    } else {
       val transaction = for {
         c <- _capital
         t <- sellAll(c)(payment, t)
@@ -73,61 +141,8 @@ trait MemberProcess extends Actor {
 
       scheduleMessage(t + timeToSell,
                       sender,
-                      DefaultFundCallResponse(rId, self, amount))
-
-    case UnfundedDefaultFundCall(rId, waterfallId, payment, maxDelay) =>
-      require(payment >= 0)
-
-      movements |+|= Map(t -> payment)
-
-      val transaction = for {
-        c <- _capital
-        t <- sellAll(c)(payment, t)
-          .ensure(s"Not sold on time for $name.") {
-            case Transaction(_, _, time) => time <= maxDelay
-          }
-      } yield t
-
-      val newCapitalF = transaction.map(_.portfolio)
-      val timeToSellF = transaction.map(_.timeToPerform)
-      val amountF = transaction.map(_.transactionAmount)
-
-      // Fails if not enough was sold or on time, reassign same capital
-      _capital = newCapitalF ||| _capital
-
-      val timeToSell = timeToSellF | Timed.zero
-      val amount = amountF | BigDecimal(0)
-
-      scheduleMessage(
-        t + timeToSell,
-        sender,
-        UnfundedDefaultFundCallResponse(rId, waterfallId, self, amount))
-
-    case VMGHLoss(loss) => movements |+|= Map(t -> loss)
-  }
-
-  private def handleMarginCall(rId: RequestId, payment: BigDecimal, maxDelay: Time, t: Time) = {
-    val transaction = for {
-      c <- _capital
-      t <- sellAll(c)(payment, t)
-        .ensure(s"Not sold on time for $name.") {
-          case Transaction(_, _, t) => t <= maxDelay
-        }
-    } yield t
-
-    val newCapitalF = transaction.map(_.portfolio)
-    val timeToSellF = transaction.map(_.timeToPerform)
-    val amountF = transaction.map(_.transactionAmount)
-
-    // Fails if not enough was sold or on time, reassign same capital
-    _capital = newCapitalF ||| _capital
-
-    val timeToSell = timeToSellF | Timed.zero
-    val amount = amountF | BigDecimal(0)
-
-    scheduleMessage(t + timeToSell,
-      sender,
-      MarginCallResponse(rId, self, amount))
+                      MarginCallResponse(rId, self, amount))
+    }
   }
 
   /**

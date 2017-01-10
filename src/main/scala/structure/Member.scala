@@ -1,10 +1,11 @@
 package structure
 
-import akka.Done
 import akka.actor.{Actor, ActorRef, Props}
+import akka.event.LoggingReceive
 import com.typesafe.scalalogging.Logger
 import market.Portfolio
-import structure.Scenario.Reset
+import structure.Member.Setup
+import structure.Scenario.Done
 import structure.Timed._
 import util.Result
 import util.Result.{Result, pure}
@@ -15,18 +16,26 @@ import util.Result.{Result, pure}
   * @param capital the assets owned with their respective liquidity.
   * @param scheduler message scheduler in order to send them in order.
   */
-case class Member(name: String, capital: Portfolio, scheduler: ActorRef)
+case class Member(name: String,
+                  capital: Portfolio,
+                  scheduler: ActorRef,
+                  _shouldDefault: Boolean)
     extends Actor
     with MemberProcess {
-  val logger: Logger = Logger(name)
-  var _capital: Result[Portfolio] = pure(capital)
   var currentTime: Time = zero
 
-  def receive: Receive = {
-    case Reset =>
+  val logger: Logger = Logger(name)
+  var _capital: Result[Portfolio] = pure(capital)
+  var movements: Map[Time, BigDecimal] = Map.empty
+  val shouldDefault: Boolean = _shouldDefault
+
+  def receive: Receive = LoggingReceive {
+    case Setup =>
+      currentTime = zero
+
       _capital = Result.pure(capital)
       movements = Map.empty
-      currentTime = zero
+
       sender ! Done
 
     case TimedMessage(t, m) =>
@@ -40,7 +49,12 @@ case class Member(name: String, capital: Portfolio, scheduler: ActorRef)
 }
 
 object Member {
-  def props[A](name: String, capital: Portfolio, scheduler: ActorRef): Props = {
-    Props(Member(name, capital, scheduler))
+  case object Setup
+
+  def props[A](name: String,
+               capital: Portfolio,
+               scheduler: ActorRef,
+               shouldDefault: Boolean = false): Props = {
+    Props(Member(name, capital, scheduler, shouldDefault))
   }
 }

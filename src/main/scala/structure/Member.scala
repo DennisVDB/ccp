@@ -1,7 +1,6 @@
 package structure
 
 import akka.actor.{Actor, ActorRef, Props}
-import akka.event.LoggingReceive
 import com.typesafe.scalalogging.Logger
 import market.Portfolio
 import structure.Member.Setup
@@ -29,7 +28,7 @@ case class Member(name: String,
   var movements: Map[Time, BigDecimal] = Map.empty
   val shouldDefault: Boolean = _shouldDefault
 
-  def receive: Receive = LoggingReceive {
+  def receive: Receive = {
     case Setup =>
       currentTime = zero
 
@@ -39,9 +38,12 @@ case class Member(name: String,
       sender ! Done
 
     case TimedMessage(t, m) =>
-      assert(
-        t >= currentTime,
-        "Received message from the past, time is +" + currentTime + ". " + m + " @" + t + " from " + sender)
+      if (t < currentTime) {
+        logger.warn("Received message from the past, time is +" + currentTime + ". " + m + " @" + t + " from " + sender)
+      }
+//      assert(
+//        t >= currentTime,
+//        "Received message from the past, time is +" + currentTime + ". " + m + " @" + t + " from " + sender)
       currentTime = currentTime max t
 
       handleMemberTimedMessages(t)(m)

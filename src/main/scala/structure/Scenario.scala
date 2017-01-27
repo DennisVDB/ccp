@@ -31,7 +31,7 @@ case class Scenario(ccps: Set[ActorRef],
                     timeHorizon: Time,
                     callEvery: Time,
                     runs: Int,
-                    portfolios: Portfolios,
+                    genPortfolios: () => Portfolios,
                     scheduler: ActorRef)
     extends Actor {
   var movements = Map.empty[String, Map[Int, BigDecimal]]
@@ -53,10 +53,12 @@ case class Scenario(ccps: Set[ActorRef],
       val t = timeHorizon + FiniteDuration(2, TimeUnit.HOURS)
       val sendData = all.map(scheduledMessage(t, _, SendData))
 
-      val genPortfolios = portfolios
+      val portfolios = genPortfolios()
 
-      val memberPortfolios = memberPortfoliosFrom(genPortfolios.members) _
-      val ccpPortfolios = ccpPortfoliosFrom(genPortfolios.ccps) _
+      val memberPortfolios = memberPortfoliosFrom(portfolios.members) _
+      val ccpPortfolios = ccpPortfoliosFrom(portfolios.ccps) _
+
+//      logger.debug(s"OK ${portfolios.members.mapValues(_.positions)}")
 
       members.foreach(_ ! Member.Setup)
 
@@ -94,7 +96,7 @@ case class Scenario(ccps: Set[ActorRef],
         }
       }
 
-    case WriteData => writeToCsv("data")(movements)
+    case WriteData => writeToCsv("results_9_80_100_bis")(movements)
   }
 
   private def scheduledMarginCalls(receiver: ActorRef)(callEvery: Time)(
@@ -138,7 +140,7 @@ object Scenario {
                timeHorizon: Time,
                callEvery: Time,
                runs: Int,
-               portfolios: Portfolios,
+               genPortfolios: () => Portfolios,
                scheduler: ActorRef): Props = {
     Props(
       Scenario(ccps,
@@ -148,7 +150,7 @@ object Scenario {
                timeHorizon,
                callEvery,
                runs,
-               portfolios,
+               genPortfolios,
                scheduler))
   }
 

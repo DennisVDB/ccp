@@ -55,7 +55,7 @@ case class Market(prices: Map[Security, BigDecimal],
              timeHorizon: Time,
              t: Time): Result[BigDecimal] = {
     // Set of positions in the portfolio.
-    val pPositions = portfolio.positions.keys.toSet
+    val pPositions = portfolio.positions.keySet
 
     // Indexes for each portfolio position.
     val pIndexes = indexes.filterKeys(pPositions)
@@ -123,7 +123,7 @@ case class Market(prices: Map[Security, BigDecimal],
           (pMuHorizon - pSigmaHorizon * zScore) max -1 // Cannot lose more than 100% if long
         else pMuHorizon + pSigmaHorizon * zScore
 
-//        _ = logger.debug(s"$pMuHorizon +- $pSigmaHorizon * $zScore")
+//        _ = logger.debug(s"$pMuHorizon +- $pSigmaHorizon * $zScore ${portfolio.positions}")
 //        _ = logger.debug(s"$ret * $price")
 
         valueAtRisk = price * ret
@@ -131,7 +131,7 @@ case class Market(prices: Map[Security, BigDecimal],
         // Only take margin if the value at risk is negative. For instance it could be
         m = -valueAtRisk max 0
 
-        _ = logger.debug(s"MARGIN $m")
+//        _ = logger.debug(s"MARGIN $m for ${portfolio.positions}")
       } yield m // valueAtRisk is negative, we flip the sign.
     }
   }

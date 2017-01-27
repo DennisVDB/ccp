@@ -51,7 +51,13 @@ trait MemberProcess extends Actor {
       if (shouldDefault) {
         scheduleMessage(t, sender, DefaultFundCallResponse(rId, self, 0))
       } else {
-        val transaction = for {
+//        scheduleMessage(t + FiniteDuration(15, MINUTES),
+//                        sender,
+//                        DefaultFundCallResponse(rId, self, payment))
+
+//        movements |+|= Map((t + FiniteDuration(15, MINUTES)) -> payment)
+
+                val transaction = for {
           c <- _capital
           t <- sellAll(c)(payment, t)
             .ensure(s"Not sold on time for $name.") {
@@ -73,7 +79,7 @@ trait MemberProcess extends Actor {
 
         scheduleMessage(t + timeToSell,
                         sender,
-                        DefaultFundCallResponse(rId, self, amount))
+                        DefaultFundCallResponse(rId, self, payment))
       }
 
     case UnfundedDefaultFundCall(rId, waterfallId, payment, maxDelay) =>
@@ -85,6 +91,13 @@ trait MemberProcess extends Actor {
           sender,
           UnfundedDefaultFundCallResponse(rId, waterfallId, self, 0))
       } else {
+//        scheduleMessage(
+//          t + FiniteDuration(15, MINUTES),
+//          sender,
+//          UnfundedDefaultFundCallResponse(rId, waterfallId, self, payment))
+//
+//        movements |+|= Map((t + FiniteDuration(15, MINUTES)) -> payment)
+
         val transaction = for {
           c <- _capital
           t <- sellAll(c)(payment, t)
@@ -108,7 +121,7 @@ trait MemberProcess extends Actor {
         scheduleMessage(
           t + timeToSell,
           sender,
-          UnfundedDefaultFundCallResponse(rId, waterfallId, self, amount))
+          UnfundedDefaultFundCallResponse(rId, waterfallId, self, payment))
       }
 
     case VMGHLoss(loss) => movements |+|= Map(t -> loss)
@@ -121,6 +134,12 @@ trait MemberProcess extends Actor {
     if (shouldDefault) {
       scheduleMessage(t, sender, MarginCallResponse(rId, self, 0))
     } else {
+//      scheduleMessage(t + FiniteDuration(15, MINUTES),
+//        sender,
+//        MarginCallResponse(rId, self, payment))
+//
+//      movements |+|= Map((t + FiniteDuration(15, MINUTES)) -> payment)
+
       val transaction = for {
         c <- _capital
         t <- sellAll(c)(payment, t)
@@ -141,7 +160,7 @@ trait MemberProcess extends Actor {
 
       scheduleMessage(t + timeToSell,
                       sender,
-                      MarginCallResponse(rId, self, amount))
+                      MarginCallResponse(rId, self, payment))
     }
   }
 

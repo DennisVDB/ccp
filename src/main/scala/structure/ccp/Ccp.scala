@@ -3,9 +3,10 @@ package structure.ccp
 import java.util.UUID
 
 import akka.actor.{Actor, ActorRef, Props}
+import akka.event.LoggingReceive
 import com.typesafe.scalalogging.Logger
 import market.Portfolio
-import market.Portfolio.{price, sellAll}
+import market.Portfolio.{Transaction, buyAll, price, sellAll}
 import structure.Scenario.Done
 import structure.Scheduler.scheduledMessage
 import structure.Timed._
@@ -55,8 +56,8 @@ class Ccp(
 
   def receive: Receive = {
     case Setup(_memberPortfolios, _ccpPortfolios) =>
-      logger.debug(s"${_ccpPortfolios.values.map(_.positions)}")
-      logger.debug(s"${_memberPortfolios.values.map(_.positions)}")
+//      logger.debug(s"${_ccpPortfolios.values.map(_.positions)}")
+//      logger.debug(s"${_memberPortfolios.values.map(_.positions)}")
       currentTime = zero
       previousCallTime = zero
       _capital = Result.pure(capital)
@@ -121,9 +122,12 @@ class Ccp(
       throw new IllegalStateException(s"Failed with $member")
 
     case TimedMessage(t, m) =>
-      assert(
-        t >= currentTime,
-        "Received message from the past, time is +" + currentTime + ". " + m + " @" + t + " from " + sender)
+      if (t < currentTime) {
+        logger.warn("Received message from the past, time is +" + currentTime + ". " + m + " @" + t + " from " + sender)
+      }
+//      assert(
+//        t >= currentTime,
+//        "Received message from the past, time is +" + currentTime + ". " + m + " @" + t + " from " + sender)
       currentTime = currentTime max t
 
       val handle = handleMemberTimedMessages(t) orElse handleCcpProcesses(t)
@@ -368,7 +372,7 @@ class Ccp(
       }
     } yield m
 
-    request.fold(e => logger.warn(e), scheduler ! _)
+    request.fold(e => e, scheduler ! _)
   }
 
   /**
@@ -436,7 +440,7 @@ class Ccp(
         .ensure("OK")(payment < _)
     } yield TriggerDefault(member, expectedPayment - payment, t)
 
-    paymentLeftMessage.fold(e => logger.warn(e), self ! _)
+    paymentLeftMessage.fold(e => e, self ! _)
 
     expectedPayments -= ((member, id))
   }
@@ -490,28 +494,31 @@ class Ccp(
       loss: BigDecimal,
       t: Time
   ): Unit = {
-    if (!defaultedMembers.contains(member)) {
-      defaultedMembers += member
+    if (loss > BigDecimal(0.0001)) {
+      if (!defaultedMembers.contains(member)) {
+        defaultedMembers += member
 
-      val cover = for {
-        portfolio <- allPortfolios.get(member) \/> s"Could not get portfolio of $member."
-        (replacementCost, timeToReplace) <- portfolio.replacementCost(t)
-      } yield
-        (FinishedStage(Start, member, loss, t),
-         FinishedStage(Start,
-                       member,
-                       replacementCost max 0,
-                       t + timeToReplace))
+        val cover = for {
+          portfolio <- allPortfolios.get(member) \/> s"Could not get portfolio of $member."
+          (replacementCost, timeToReplace) <- portfolio.replacementCost(t)
+          _ = logger.debug(s"$member -- PFOLIO ${replacementCost}")
+        } yield
+          (FinishedStage(Start, member, loss, t),
+            FinishedStage(Start,
+              member,
+              replacementCost max 0,
+              t + timeToReplace))
 
-      // Margin payments are not paid during waterfalls if VMGH is used.
-      haircutsInProgress += 2
+        // Margin payments are not paid during waterfalls if VMGH is used.
+        haircutsInProgress += 2
 
-      cover.map(_._1).fold(e => throw new IllegalStateException(e), self ! _)
-      cover.map(_._2).fold(e => throw new IllegalStateException(e), self ! _)
-    } else {
-      // Happens when the CCP is waiting for two calls, and the member defaults on both.
-      haircutsInProgress += 1
-      self ! FinishedStage(Start, member, loss, t)
+        cover.map(_._1).fold(e => throw new IllegalStateException(e), self ! _)
+        cover.map(_._2).fold(e => throw new IllegalStateException(e), self ! _)
+      } else {
+        // Happens when the CCP is waiting for two calls, and the member defaults on both.
+        haircutsInProgress += 1
+        self ! FinishedStage(Start, member, loss, t)
+      }
     }
   }
 
@@ -1027,7 +1034,7 @@ class Ccp(
     assert(loss >= 0,
            s"Too much has been used during stage $currentStage - $loss")
 
-    logger.debug(s"Finished $currentStage with $loss @$t ($member)")
+//    logger.debug(s"Finished $currentStage with $loss @$t ($member)")
 
     def toInternalStage(s: WaterfallStage)(member: ActorRef,
                                            loss: BigDecimal): InternalStage =
